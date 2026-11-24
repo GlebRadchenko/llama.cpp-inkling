@@ -556,18 +556,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
 
-    extern int ggml_metal_n_dispatch;
-    const int n_disp0 = ggml_metal_n_dispatch;
     int res = ggml_metal_op_encode_impl(ctx, idx);
-    {
-        // experiment: GGML_METAL_TIMING=5 prints the dispatches of the encode calls of one big graph, keyed by op (+ fused span)
-        static int mode = -1; if (mode < 0) { const char * e = getenv("GGML_METAL_TIMING"); mode = e ? atoi(e) : 0; }
-        if (mode == 5 && ctx->n_nodes() > 3000 && ggml_metal_n_dispatch > n_disp0) {
-            const ggml_tensor * t = ctx->node(idx);
-            fprintf(stderr, "enc %-14s span=%d disp=%d %s\n", t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : ggml_op_name(t->op),
-                res, ggml_metal_n_dispatch - n_disp0, t->name);
-        }
-    }
     if (idx + res > ctx->n_nodes()) {
         GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
                 "https://github.com/ggml-org/llama.cpp/pull/14849");
