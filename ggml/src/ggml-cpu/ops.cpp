@@ -3533,6 +3533,58 @@ static void ggml_compute_forward_swiglu(
 
 // ggml_compute_forward_swiglu_oai
 
+static void ggml_compute_forward_situ_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    char * src0_d = (char *) src0->data;
+    char * src1_d = (char *) (src1 ? src1->data : src0->data);
+    const size_t src0_o = src0->nb[1];
+    const size_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    const int nr = ggml_nrows(src0);
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+    const float beta = ggml_get_op_params_f32(dst, 2);
+    const float lb   = ggml_get_op_params_f32(dst, 3);
+
+    const int dr  = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * src0_p = (float *) (src0_d + i1*src0_o);
+        float * src1_p = (float *) (src1_d + i1*src1_o);
+        float * dst_p  = (float *) ((char *) dst->data + i1*(dst->nb[1]));
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        for (int k = 0; k < nc; k++) {
+            const float g = src0_p[k];
+            const float u = src1_p[k];
+            const float act = beta*tanhf(g*(1.0f/beta)) * (1.0f/(1.0f + expf(-g)));
+            dst_p[k] = act * (lb > 0.0f ? lb*tanhf(u*(1.0f/lb)) : u);
+        }
+    }
+}
+
 static void ggml_compute_forward_swiglu_oai_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -10668,6 +10720,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU:
             {
                 ggml_compute_forward_swiglu(params, dst);
+            } break;
+        case GGML_GLU_OP_SITU:
+            {
+                ggml_compute_forward_situ_f32(params, dst);
             } break;
         case GGML_GLU_OP_SWIGLU_OAI:
             {

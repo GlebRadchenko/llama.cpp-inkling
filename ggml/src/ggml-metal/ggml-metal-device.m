@@ -887,11 +887,14 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
+int ggml_metal_n_dispatch = 0, ggml_metal_n_barrier = 0; // experiment: counters for GGML_METAL_TIMING
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    ggml_metal_n_dispatch++;
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+    ggml_metal_n_barrier++;
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
@@ -1622,6 +1625,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
                     return ggml_is_contiguous_1(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+                case GGML_GLU_OP_SITU:
+                    return ggml_is_contiguous_1(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
                default:
                     return false;
             }

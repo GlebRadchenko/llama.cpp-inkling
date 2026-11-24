@@ -344,6 +344,33 @@ kernel void kernel_swiglu_oai(
 
 typedef decltype(kernel_swiglu_oai<float>) kernel_swiglu_oai_t;
 
+// beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), in the op order of the unfused graph (alpha = beta, limit = lb)
+kernel void kernel_situ_f32(
+        constant ggml_metal_kargs_glu & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint2 tgpig[[threadgroup_position_in_grid]],
+        uint2 tpitg[[thread_position_in_threadgroup]],
+        uint2   ntg[[threads_per_threadgroup]],
+        uint2  ntgs[[threadgroups_per_grid]]) {
+    device const float * src0_row = (device const float *) ((device const char *) src0 + tgpig.y*args.nb01) + args.i00;
+    device const float * src1_row = (device const float *) ((device const char *) src1 + tgpig.y*args.nb11) + args.i10;
+    device       float * dst_row  = (device       float *) ((device       char *) dst  + tgpig.y*args.nb1);
+
+    const float beta = args.alpha;
+    const float lb   = args.limit;
+
+    for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
+        const float g = src0_row[i0];
+        const float u = src1_row[i0];
+
+        const float act = (beta*precise::tanh((1.0f/beta)*g)) * (1 / (1 + exp(-g)));
+
+        dst_row[i0] = act * (lb > 0.0f ? lb*precise::tanh((1.0f/lb)*u) : u);
+    }
+}
+
 template [[host_name("kernel_swiglu_oai_f32")]] kernel kernel_swiglu_oai_t kernel_swiglu_oai<float>;
 template [[host_name("kernel_swiglu_oai_f16")]] kernel kernel_swiglu_oai_t kernel_swiglu_oai<half>;
 
