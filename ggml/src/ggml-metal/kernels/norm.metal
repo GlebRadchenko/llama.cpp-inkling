@@ -368,3 +368,115 @@ kernel void kernel_group_norm_f32(
         }
     }
 }
+
+// attention over depth, one threadgroup of 8 simdgroups per token: the squares of cur and the dots of every row with every
+// query in one pass, then the softmax per query and the mix in a second pass. rows: [states..., rms_norm(cur)]
+constant short FC_depth_mix_nq [[function_constant(FC_DEPTH_MIX + 0)]];
+constant short FC_depth_mix_nb [[function_constant(FC_DEPTH_MIX + 1)]];
+
+#define DM_NQ   FC_depth_mix_nq
+#define DM_NB   FC_depth_mix_nb
+#define DM_NACC (1 + DM_NQ*(DM_NB + 1))
+
+kernel void kernel_depth_mix_f32(
+        constant ggml_metal_kargs_depth_mix & args,
+        device const char * cur,
+        device const char * query,
+        device const char * states,
+        device       char * dst,
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    const int n4 = args.ne0/4;
+
+    device const float4 * x = (device const float4 *) (cur + tgpig*args.nb_cur);
+    device const char   * s = states + tgpig*args.nbs2;
+
+    // acc[0]: |x|^2, acc[1 + q]: <x, q>, acc[1 + DM_NQ*(1 + b) + q]: <states_b, q>
+    float acc[1 + 4*9];
+    for (short k = 0; k < DM_NACC; ++k) {
+        acc[k] = 0.0f;
+    }
+
+    for (int i = tpitg; i < n4; i += ntg) {
+        float4 qv[4];
+        for (short q = 0; q < DM_NQ; ++q) {
+            qv[q] = ((device const float4 *) (query + q*args.nb_q))[i];
+        }
+        const float4 xv = x[i];
+        acc[0] += dot(xv, xv);
+        for (short q = 0; q < DM_NQ; ++q) {
+            acc[1 + q] += dot(xv, qv[q]);
+        }
+        for (short b = 0; b < DM_NB; ++b) {
+            const float4 sv = ((device const float4 *) (s + b*args.nbs1))[i];
+            for (short q = 0; q < DM_NQ; ++q) {
+                acc[1 + DM_NQ*(1 + b) + q] += dot(sv, qv[q]);
+            }
+        }
+    }
+
+    for (short k = 0; k < DM_NACC; ++k) {
+        acc[k] = simd_sum(acc[k]);
+    }
+    if (tiisg == 0) {
+        for (short k = 0; k < DM_NACC; ++k) {
+            shmem[sgitg*DM_NACC + k] = acc[k];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const short n_sg = (ntg + 31)/32;
+    if (tpitg < DM_NACC) {
+        float v = 0.0f;
+        for (short g = 0; g < n_sg; ++g) {
+            v += shmem[g*DM_NACC + tpitg];
+        }
+        shmem[8*DM_NACC + tpitg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short k = 0; k < DM_NACC; ++k) {
+        acc[k] = shmem[8*DM_NACC + k];
+    }
+
+    const float r = 1.0f/sqrt(acc[0]/args.ne0 + args.eps);
+
+    // softmax weights per query: p[q][b] for the states, p[q][DM_NB] for cur
+    float p[4][9];
+    for (short q = 0; q < DM_NQ; ++q) {
+        const float sc = acc[1 + q]*r*args.scale;
+        float m = sc;
+        for (short b = 0; b < DM_NB; ++b) {
+            m = max(m, acc[1 + DM_NQ*(1 + b) + q]*args.scale);
+        }
+        float sum = exp(sc - m);
+        p[q][DM_NB] = sum;
+        for (short b = 0; b < DM_NB; ++b) {
+            p[q][b] = exp(acc[1 + DM_NQ*(1 + b) + q]*args.scale - m);
+            sum += p[q][b];
+        }
+        const float inv = 1.0f/sum;
+        for (short b = 0; b <= DM_NB; ++b) {
+            p[q][b] *= inv;
+        }
+    }
+
+    for (int i = tpitg; i < n4; i += ntg) {
+        const float4 xn = x[i]*r;
+        float4 sv[8];
+        for (short b = 0; b < DM_NB; ++b) {
+            sv[b] = ((device const float4 *) (s + b*args.nbs1))[i];
+        }
+        for (short q = 0; q < DM_NQ; ++q) {
+            float4 o = p[q][DM_NB]*xn;
+            for (short b = 0; b < DM_NB; ++b) {
+                o += p[q][b]*sv[b];
+            }
+            ((device float4 *) (dst + q*args.nb1 + tgpig*args.nb2))[i] = o;
+        }
+    }
+}

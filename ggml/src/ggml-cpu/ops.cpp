@@ -2908,6 +2908,71 @@ void ggml_compute_forward_silu_back(
 }
 
 
+// ggml_compute_forward_depth_mix
+
+void ggml_compute_forward_depth_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cur    = dst->src[0];
+    const ggml_tensor * query  = dst->src[1];
+    const ggml_tensor * states = dst->src[2];
+
+    const int64_t n_embd = cur->ne[0];
+    const int64_t n_q    = dst->ne[1];
+    const int64_t n_tok  = dst->ne[2];
+    const int64_t n_b    = states ? states->ne[1] : 0;
+
+    float scale, eps;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&eps,   (const float *) dst->op_params + 1, sizeof(float));
+
+    std::vector<float> normed(n_embd);
+    std::vector<const float *> rows(n_b + 1);
+    std::vector<float> p(n_b + 1);
+
+    for (int64_t t = params->ith; t < n_tok; t += params->nth) {
+        const float * x = (const float *) cur->data + t*n_embd;
+        float ss = 0.0f;
+        for (int64_t e = 0; e < n_embd; ++e) {
+            ss += x[e]*x[e];
+        }
+        const float r = 1.0f/sqrtf(ss/n_embd + eps);
+        for (int64_t e = 0; e < n_embd; ++e) {
+            normed[e] = x[e]*r;
+        }
+        for (int64_t b = 0; b < n_b; ++b) {
+            rows[b] = (const float *) ((const char *) states->data + b*states->nb[1] + t*states->nb[2]);
+        }
+        rows[n_b] = normed.data();
+
+        for (int64_t q = 0; q < n_q; ++q) {
+            const float * qv = (const float *) query->data + q*n_embd;
+            float m = -INFINITY;
+            for (int64_t b = 0; b <= n_b; ++b) {
+                float s = 0.0f;
+                for (int64_t e = 0; e < n_embd; ++e) {
+                    s += rows[b][e]*qv[e];
+                }
+                p[b] = s*scale;
+                m = std::max(m, p[b]);
+            }
+            float sum = 0.0f;
+            for (int64_t b = 0; b <= n_b; ++b) {
+                p[b] = expf(p[b] - m);
+                sum += p[b];
+            }
+            float * y = (float *) ((char *) dst->data + q*dst->nb[1] + t*dst->nb[2]);
+            for (int64_t e = 0; e < n_embd; ++e) {
+                float o = 0.0f;
+                for (int64_t b = 0; b <= n_b; ++b) {
+                    o += p[b]*rows[b][e];
+                }
+                y[e] = o/sum;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_sigmoid_back
 
 static void ggml_compute_forward_sigmoid_back_f32(

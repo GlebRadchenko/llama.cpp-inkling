@@ -1151,9 +1151,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 
     "SIGMOID_BACK",
+    "DEPTH_MIX",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1269,9 +1270,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 
     "sigmoid_back(x)",
+    "depth_mix(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2904,6 +2906,40 @@ struct ggml_tensor * ggml_silu_back(
     result->op     = GGML_OP_SILU_BACK;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_depth_mix
+
+struct ggml_tensor * ggml_depth_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * states,
+        float                 scale,
+        float                 eps) {
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = ggml_nrows(cur);
+    const int64_t n_q      = ggml_nrows(query);
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && query->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(cur) && ggml_is_contiguous(query));
+    GGML_ASSERT(query->ne[0] == n_embd && n_q >= 1 && n_q <= 4);
+    if (states) {
+        GGML_ASSERT(states->type == GGML_TYPE_F32 && states->ne[0] == n_embd && states->nb[0] == sizeof(float));
+        GGML_ASSERT(states->ne[1] <= 8 && states->ne[2] == n_tokens && states->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_q, n_tokens);
+
+    const float params[2] = { scale, eps };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DEPTH_MIX;
+    result->src[0] = cur;
+    result->src[1] = query;
+    result->src[2] = states;
 
     return result;
 }

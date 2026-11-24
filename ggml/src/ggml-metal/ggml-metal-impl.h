@@ -132,6 +132,7 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_DEPTH_MIX                   2600
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -675,6 +676,20 @@ typedef struct {
     uint64_t nb3;
     float    eps;
 } ggml_metal_kargs_l2_norm;
+
+typedef struct {
+    int32_t  ne0;    // n_embd
+    int32_t  n_q;
+    int32_t  n_b;
+    uint64_t nb_cur; // cur, per token
+    uint64_t nb_q;   // query, per query
+    uint64_t nbs1;   // states, per block
+    uint64_t nbs2;   // states, per token
+    uint64_t nb1;    // dst, per query
+    uint64_t nb2;    // dst, per token
+    float    scale;
+    float    eps;
+} ggml_metal_kargs_depth_mix;
 
 typedef struct {
     int64_t  ne00;

@@ -400,6 +400,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_diag(ctx, idx);
             } break;
+        case GGML_OP_DEPTH_MIX:
+            {
+                n_fuse = ggml_metal_op_depth_mix(ctx, idx);
+            } break;
         case GGML_OP_L2_NORM:
             {
                 n_fuse = ggml_metal_op_l2_norm(ctx, idx);
@@ -4584,6 +4588,50 @@ int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * cur    = op->src[0];
+    const ggml_tensor * query  = op->src[1];
+    const ggml_tensor * states = op->src[2];
+
+    float params[2];
+    memcpy(params, op->op_params, sizeof(params));
+
+    ggml_metal_kargs_depth_mix args = {
+        /*.ne0    =*/ (int32_t) cur->ne[0],
+        /*.n_q    =*/ (int32_t) op->ne[1],
+        /*.n_b    =*/ states ? (int32_t) states->ne[1] : 0,
+        /*.nb_cur =*/ cur->ne[0]*sizeof(float),
+        /*.nb_q   =*/ query->ne[0]*sizeof(float),
+        /*.nbs1   =*/ states ? states->nb[1] : 0,
+        /*.nbs2   =*/ states ? states->nb[2] : 0,
+        /*.nb1    =*/ op->nb[1],
+        /*.nb2    =*/ op->nb[2],
+        /*.scale  =*/ params[0],
+        /*.eps    =*/ params[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_depth_mix(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(query), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(states ? states : cur), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),    4);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+    // one threadgroup of 8 simdgroups per token
+    ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[2], 1, 1, 256, 1, 1);
 
     return 1;
 }

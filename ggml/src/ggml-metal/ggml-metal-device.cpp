@@ -2251,6 +2251,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_met
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_DEPTH_MIX);
+    GGML_UNUSED(op);
+
+    const char * base = "kernel_depth_mix_f32";
+    const int16_t n_q = op->ne[1];
+    const int16_t n_b = op->src[2] ? op->src[2]->ne[1] : 0;
+
+    char name[256];
+    snprintf(name, 256, "%s_nq=%d_nb=%d", base, n_q, n_b);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, n_q, FC_DEPTH_MIX + 0);
+        ggml_metal_cv_set_int16(cv, n_b, FC_DEPTH_MIX + 1);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    // per-simdgroup partial sums of 1 + n_q*(n_b + 1) accumulators for 8 simdgroups, and their totals
+    res.smem = GGML_PAD(9*(1 + n_q*(n_b + 1))*sizeof(float), 16);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_GROUP_NORM);
 

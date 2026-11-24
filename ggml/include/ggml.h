@@ -451,6 +451,7 @@ extern "C" {
         GGML_OP_SLEEP,
 
         GGML_OP_SIGMOID_BACK,
+        GGML_OP_DEPTH_MIX,
 
         GGML_OP_COUNT,
     };
@@ -1060,6 +1061,16 @@ extern "C" {
 
     // a - dy
     // b - x
+    // attention over depth, per token: rows [states..., rms_norm(cur, eps)], out[:, q] = sum_b softmax_b(scale*<row_b, query[:, q]>)*row_b
+    // cur [n_embd, n_tokens] contiguous, query [n_embd, n_q <= 4], states [n_embd, n_b <= 8, n_tokens] or NULL -> [n_embd, n_q, n_tokens]
+    GGML_API struct ggml_tensor * ggml_depth_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * states,
+            float                 scale,
+            float                 eps);
+
     GGML_API struct ggml_tensor * ggml_sigmoid_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

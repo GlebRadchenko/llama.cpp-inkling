@@ -245,30 +245,12 @@ const llama_model_inkling2::graph::block_stack * llama_model_inkling2::graph::st
 }
 
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il) {
-    // rows [blocks.back(), ..., blocks.front(), cur], each RMS-normalized; shared by every mix over the same blocks and cur
-    const ggml_backend_dev_t dev = il < 0 ? nullptr : model.dev_layer(il);
-    auto key = std::make_pair(dev, blocks);
-    key.second.push_back(cur);
-    block_stack & all = mix_states[key];
-    if (!all.states) {
-        ggml_tensor * normed   = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), 1e-6f);
-        ggml_tensor * normed_t = ggml_reshape_3d(ctx0, normed, 1, n_embd, n_tokens);
-
-        const block_stack * st = stack(blocks, il);
-        all.states   = st ? ggml_concat(ctx0, st->states,   normed,   1) : normed;
-        all.states_t = st ? ggml_concat(ctx0, st->states_t, normed_t, 0) : normed_t;
+    // rows [blocks.back(), ..., blocks.front(), cur], each RMS-normalized; the blocks are normalized and stacked once per graph
+    const block_stack * st = stack(blocks, il);
+    if (!ggml_is_contiguous(cur)) {
+        cur = ggml_cont(ctx0, cur);
     }
-    ggml_tensor * states   = all.states;
-    ggml_tensor * states_t = all.states_t;
-
-    // one token: the query broadcasts as is
-    ggml_tensor * queries = n_tokens == 1 ? query :
-        ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
-
-    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
-    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
-
-    return ggml_mul_mat(ctx0, states_t, scores);
+    return ggml_depth_mix(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), query, st ? st->states : nullptr, 1.0f/sqrtf(n_embd), 1e-6f);
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
