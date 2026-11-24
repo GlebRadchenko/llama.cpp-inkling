@@ -1959,7 +1959,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * slots,
-                 bool   cached) const {
+                 bool   cached,
+          ggml_tensor ** s_rows) const {
     ggml_tensor * w_s = model.get_w_scale(w);
 
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
@@ -1985,7 +1986,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
         }
         s = ggml_get_rows(ctx0, s, ids);
-        res = ggml_mul(ctx0, res, s);
+        if (s_rows && loras->empty()) {
+            *s_rows = s;
+        } else {
+            res = ggml_mul(ctx0, res, s);
+        }
     }
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -2599,12 +2604,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
+    // the per-expert down scale, gathered per row, when it is folded into the router weights
+    ggml_tensor * down_s = nullptr;
+
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
         ggml_tensor * up = nullptr;
 
+        // situ takes the per-expert gate_up scale as a row scale, the down scale joins the router weights
+        ggml_tensor * gate_up_s = nullptr;
+        const bool fold_scales = type_op == LLM_FFN_SITU && !gate_up_exps_b && !mm_ids;
+
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached, fold_scales ? &gate_up_s : nullptr); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (gate_up_exps_b) {
@@ -2680,7 +2692,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    cur = ggml_situ(ctx0, cur, up, beta, lb);
+                    cur = gate_up_s ? ggml_situ_scaled(ctx0, cur, up, gate_up_s, beta, lb) : ggml_situ(ctx0, cur, up, beta, lb);
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:
@@ -2731,7 +2743,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached,
+                fold_scales && !down_exps_b && !post_exp_norm && !weight_before_ffn ? &down_s : nullptr); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
@@ -2762,7 +2775,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // the down scale times the router weights: [1, n_used, n_tokens], off the path of the experts
+        experts = ggml_mul(ctx0, experts, down_s ? ggml_mul(ctx0, weights, down_s) : weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 

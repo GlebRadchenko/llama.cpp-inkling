@@ -3208,6 +3208,20 @@ struct ggml_tensor * ggml_situ(
     return result;
 }
 
+struct ggml_tensor * ggml_situ_scaled(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * s,
+        float                 beta,
+        float                 lb) {
+    GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_is_contiguous(s) && s->ne[0] == 1 && ggml_nelements(s) == ggml_nrows(a));
+    struct ggml_tensor * result = ggml_situ(ctx, a, b, beta, lb);
+    result->src[2] = s;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_swiglu_oai(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,

@@ -889,6 +889,7 @@ typedef struct{
     int32_t  i10;
     float    alpha;
     float    limit;
+    int32_t  has_s; // situ: src[2] holds a scale per row
 } ggml_metal_kargs_glu;
 
 typedef struct {

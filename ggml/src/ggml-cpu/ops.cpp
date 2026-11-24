@@ -3641,9 +3641,10 @@ static void ggml_compute_forward_situ_f32(
             src1_p += swapped ? 0 : nc;
         }
 
+        const float rs = dst->src[2] ? ((const float *) dst->src[2]->data)[i1] : 1.0f;
         for (int k = 0; k < nc; k++) {
-            const float g = src0_p[k];
-            const float u = src1_p[k];
+            const float g = dst->src[2] ? src0_p[k]*rs : src0_p[k];
+            const float u = dst->src[2] ? src1_p[k]*rs : src1_p[k];
             const float act = beta*tanhf(g*(1.0f/beta)) * (1.0f/(1.0f + expf(-g)));
             dst_p[k] = act * (lb > 0.0f ? lb*tanhf(u*(1.0f/lb)) : u);
         }

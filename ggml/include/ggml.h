@@ -1237,6 +1237,15 @@ extern "C" {
             float                 beta,
             float                 lb);
 
+    // ggml_situ of a*s and b*s, s one value per row of a: [1, ne1, ne2, ne3]
+    GGML_API struct ggml_tensor * ggml_situ_scaled(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * s,
+            float                 beta,
+            float                 lb);
+
     GGML_API struct ggml_tensor * ggml_swiglu_oai(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

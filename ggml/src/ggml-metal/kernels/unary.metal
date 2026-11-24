@@ -350,6 +350,7 @@ kernel void kernel_situ_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const float * rows, // per-row scale when args.has_s
         uint2 tgpig[[threadgroup_position_in_grid]],
         uint2 tpitg[[thread_position_in_threadgroup]],
         uint2   ntg[[threads_per_threadgroup]],
@@ -360,10 +361,12 @@ kernel void kernel_situ_f32(
 
     const float beta = args.alpha;
     const float lb   = args.limit;
+    const bool  has_s = args.has_s != 0;
+    const float rs    = has_s ? rows[tgpig.y] : 1.0f;
 
     for (int i0 = tgpig.x*ntg.x + tpitg.x; i0 < args.ne0; i0 += ntg.x*ntgs.x) {
-        const float g = src0_row[i0];
-        const float u = src1_row[i0];
+        const float g = has_s ? src0_row[i0]*rs : src0_row[i0];
+        const float u = has_s ? src1_row[i0]*rs : src1_row[i0];
 
         const float act = (beta*precise::tanh((1.0f/beta)*g)) * (1 / (1 + exp(-g)));
 
