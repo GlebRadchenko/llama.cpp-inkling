@@ -190,6 +190,11 @@ void llama_model_inkling2::post_load_data() {
             }
             conv_folded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1], 1, v.data());
         }
+        if (ggml_tensor * w = layer.attn_rel_bias; w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w)) {
+            std::vector<float> v(w->ne[0]*(w->ne[1] + 1), 0.0f);
+            ggml_backend_tensor_get(w, v.data(), 0, ggml_nbytes(w));
+            rel_bias_padded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1] + 1, 1, v.data());
+        }
     }
 }
 
@@ -622,9 +627,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             if (v_rot) {
                 cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
             }
+        } else if (n_tokens == 1) {
+            // one query: gather its bias rows, then project straight into the [n_kv, 1, n_head] bias,
+            // and its per-query sink is a per-head sink of the attention
+            const auto & padded = static_cast<const llama_model_inkling2 &>(model).rel_bias_padded;
+            const auto it = padded.find(layer.attn_rel_bias);
+            ggml_tensor * table = it != padded.end() ? it->second : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+            ggml_tensor * kq_b = ggml_mul_mat(ctx0, ggml_get_rows(ctx0, table, rel_pos), Rcur);
+            kq_b = ggml_reshape_4d(ctx0, kq_b, n_kv, 1, n_head, 1);
+            cb(kq_b, "kq_b", il);
+            cur = build_attn(inp, nullptr, nullptr, nullptr, Qcur, Kcur, Vcur, kq_b, ggml_reshape_1d(ctx0, sinks, n_head),
+                    1.0f/sqrtf(n_embd_head), il, 0);
         } else {
             // project before gathering: only the gathered bias is n_kv x n_tokens x n_head
-            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+            const auto & padded = static_cast<const llama_model_inkling2 &>(model).rel_bias_padded;
+            const auto it = padded.find(layer.attn_rel_bias);
+            ggml_tensor * table = ggml_mul_mat(ctx0, it != padded.end() ? it->second : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
             // per-query sink t: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s)))
             table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));

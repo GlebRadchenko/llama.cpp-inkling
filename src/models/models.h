@@ -2593,6 +2593,8 @@ struct llama_model_inkling2 : public llama_model_base {
     void post_load_data() override;
     // derived at load: (cur + conv(x, w))*s as one conv, by source weight (the current input is the last tap)
     std::unordered_map<const ggml_tensor *, ggml_tensor *> conv_folded;
+    // derived at load: the relative-bias tables with the zero row of the out-of-extent positions, by source weight
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> rel_bias_padded;
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
