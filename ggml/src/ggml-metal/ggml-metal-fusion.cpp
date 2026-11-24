@@ -286,6 +286,57 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+// CONCAT + CPY + SSM_CONV: x = [past, input^T] along the window, the cpy stores the last nc - 1 columns of x into the
+// recurrent state, the conv reads x. the fused kernel never materializes x
+static bool ggml_metal_fusion_check_conv_state(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    const ggml_tensor * cat  = nodes[0];
+    const ggml_tensor * cpy  = nodes[1];
+    const ggml_tensor * conv = nodes[2];
+
+    if (cat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cat, 0) != 0 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * past = cat->src[0];
+    const ggml_tensor * inp  = cat->src[1];
+    const ggml_tensor * w    = conv->src[1];
+    if (past->type != GGML_TYPE_F32 || inp->type != GGML_TYPE_F32 || past->nb[0] != sizeof(float) || cat->ne[3] != 1) {
+        return false;
+    }
+    const int64_t nc = w->ne[0];
+    if (conv->src[0] != cat || conv->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+            nc < 2 || nc > 8 || past->ne[0] != nc - 1 || w->ne[1] != cat->ne[1]) {
+        return false;
+    }
+    const int64_t n_t = inp->ne[0];
+
+    // the cpy stores the last nc - 1 columns of x
+    const ggml_tensor * last = cpy->src[0];
+    const ggml_tensor * cell = cpy->src[1];
+    if ((cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || last->view_src != cat || last->view_offs != n_t*sizeof(float) ||
+            last->ne[0] != nc - 1 || last->ne[1] != cat->ne[1] || last->ne[2] != cat->ne[2] || last->ne[3] != 1 ||
+            last->nb[1] != cat->nb[1] || last->nb[2] != cat->nb[2]) {
+        return false;
+    }
+    if (cell->type != GGML_TYPE_F32 || cell->nb[0] != sizeof(float) || cell->ne[0] != (nc - 1)*cat->ne[1] ||
+            cell->ne[1] != cat->ne[2] || cell->ne[2] != 1 || cell->ne[3] != 1) {
+        return false;
+    }
+
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion       * fusion,
@@ -831,6 +882,7 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
+static const std::vector<ggml_op> ops_conv_state    = { GGML_OP_CONCAT, GGML_OP_CPY, GGML_OP_SSM_CONV };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
@@ -911,6 +963,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SSM_CONV_SILU, ops_ssm_conv_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
 
     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
+
+    { GGML_METAL_FUSION_CONV_STATE, ops_conv_state, {}, true, ggml_metal_fusion_check_conv_state },
 };
 
 // ---- alloc deps -----------------------------------------------------------

@@ -692,6 +692,22 @@ typedef struct {
 } ggml_metal_kargs_depth_mix;
 
 typedef struct {
+    int32_t  n_ch;  // channels
+    int32_t  n_t;   // tokens per sequence
+    uint64_t nbp1;  // past, per channel (contiguous along the window)
+    uint64_t nbp2;  // past, per sequence
+    uint64_t nbi0;  // input, per token
+    uint64_t nbi1;  // input, per channel
+    uint64_t nbi2;  // input, per sequence
+    uint64_t nbw1;  // weight, per channel
+    uint64_t nb1;   // dst, per token
+    uint64_t nb2;   // dst, per sequence
+    uint64_t nbs1;  // state cell, per sequence
+    uint64_t nbx1;  // x = the concat, per channel (contiguous along the window)
+    uint64_t nbx2;  // x, per sequence
+} ggml_metal_kargs_conv_state;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

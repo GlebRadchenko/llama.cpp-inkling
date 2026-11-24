@@ -122,9 +122,25 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
 void llama_model_inkling2_loop::post_load_data() {
     llama_model_inkling2::post_load_data();
 
-    const int64_t n_in  = 2*hparams.n_embd;
-    const int64_t rank  = gate_rank;
-    const int64_t n_mat = n_in*rank; // elements of a down, and of a forget plus a gain
+    const int64_t n_embd = hparams.n_embd;
+    const int64_t n_in   = 2*n_embd;
+    const int64_t rank   = gate_rank;
+    const int64_t n_mat  = n_in*rank; // elements of a down, and of a forget plus a gain
+
+    // legacy layout: the q, k, v and ffn message queries of each core layer stacked once, see legacy_query()
+    if (legacy && legacy_res_query->type == GGML_TYPE_F32 && legacy_kv_res_query->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(legacy_res_query) && ggml_is_contiguous(legacy_kv_res_query)) {
+        const size_t row = n_embd*sizeof(float);
+        std::vector<float> q(LOOP_CTRL_COUNT*n_embd);
+        for (size_t i = 0; i < loop_layers.size(); ++i) {
+            ggml_backend_tensor_get(legacy_res_query,    q.data() + 0*n_embd, (2*i + 0)*row, row);
+            ggml_backend_tensor_get(legacy_kv_res_query, q.data() + 1*n_embd, (2*i + 0)*row, row);
+            ggml_backend_tensor_get(legacy_kv_res_query, q.data() + 2*n_embd, (2*i + 1)*row, row);
+            ggml_backend_tensor_get(legacy_res_query,    q.data() + 3*n_embd, (2*i + 1)*row, row);
+            loop_layers[i].msg_query = new_derived_weight(legacy_res_query, GGML_TYPE_F32, n_embd, LOOP_CTRL_COUNT, 1, q.data());
+        }
+    }
+
     for (auto & l : loop_layers) {
         bool ok = true;
         for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {

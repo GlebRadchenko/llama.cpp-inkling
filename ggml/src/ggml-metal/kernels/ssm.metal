@@ -474,3 +474,53 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
 }
+
+// short conv over [past, input] with the state store (GGML_METAL_FUSION_CONV_STATE): one thread per channel and sequence
+kernel void kernel_conv_state_f32(
+        constant ggml_metal_kargs_conv_state & args,
+        device const char * past,
+        device const char * inp,
+        device const char * w,
+        device       char * dst,
+        device       char * state,
+        device       char * x,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]]) {
+    const int c = tgpig.x*ntg.x + tpitg.x;
+    const int s = tgpig.y;
+    if (c >= args.n_ch) {
+        return;
+    }
+
+    const int nc = FC_ssm_conv_nc;
+
+    float win[8];
+    device const float * p  = (device const float *) (past + c*args.nbp1 + s*args.nbp2);
+    device       float * xc = (device       float *) (x    + c*args.nbx1 + s*args.nbx2);
+    for (int k = 0; k < nc - 1; ++k) {
+        win[k] = p[k];
+        xc[k]  = win[k];
+    }
+    device const float * wc = (device const float *) (w + c*args.nbw1);
+
+    for (int t = 0; t < args.n_t; ++t) {
+        win[nc - 1] = *((device const float *) (inp + t*args.nbi0 + c*args.nbi1 + s*args.nbi2));
+        xc[nc - 1 + t] = win[nc - 1];
+
+        float sumf = 0.0f;
+        for (int k = 0; k < nc; ++k) {
+            sumf += win[k] * wc[k];
+        }
+        *((device float *) (dst + c*sizeof(float) + t*args.nb1 + s*args.nb2)) = sumf;
+
+        for (int k = 0; k < nc - 1; ++k) {
+            win[k] = win[k + 1];
+        }
+    }
+
+    device float * st = (device float *) (state + s*args.nbs1) + c*(nc - 1);
+    for (int k = 0; k < nc - 1; ++k) {
+        st[k] = win[k];
+    }
+}
