@@ -2593,14 +2593,14 @@ struct llama_model_inkling2 : public llama_model_base {
     void post_load_data() override;
     // derived at load: (cur + conv(x, w))*s as one conv, by source weight (the current input is the last tap)
     std::unordered_map<const ggml_tensor *, ggml_tensor *> conv_folded;
-    // derived at load: the relative-bias tables with the zero row of the out-of-extent positions, by source weight
+    // derived at load: the relative-bias tables times the R clip threshold, with the zero row of the out-of-extent positions, by source weight
     std::unordered_map<const ggml_tensor *, ggml_tensor *> rel_bias_padded;
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         // il: the layer whose device runs the mix (the shared stacks are kept per device), -1 if unknown
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il = -1);
-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il);
+        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il, bool unit = false);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
                 ggml_tensor * weight,
