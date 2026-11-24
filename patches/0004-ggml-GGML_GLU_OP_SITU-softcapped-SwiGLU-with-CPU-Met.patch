@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  8 files changed, 115 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index e3e8848..73fa7cd 100644
+index 43df51f..789bf4d 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -490,6 +490,7 @@ extern "C" {
@@ -58,7 +58,7 @@ index ff4c1af..534864a 100644
                          n_tasks = n_threads;
                      } break;
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 19d92b9..dccd259 100644
+index 5b08a87..3a46127 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -3533,6 +3533,58 @@ static void ggml_compute_forward_swiglu(
@@ -120,7 +120,7 @@ index 19d92b9..dccd259 100644
  static void ggml_compute_forward_swiglu_oai_f32(
          const ggml_compute_params * params,
          ggml_tensor * dst) {
-@@ -10669,6 +10721,10 @@ void ggml_compute_forward_glu(
+@@ -10710,6 +10762,10 @@ void ggml_compute_forward_glu(
              {
                  ggml_compute_forward_swiglu(params, dst);
              } break;
@@ -132,7 +132,7 @@ index 19d92b9..dccd259 100644
              {
                  ggml_compute_forward_swiglu_oai(params, dst);
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index dab0d8a..fb21892 100644
+index 7a732e2..4ef7cd3 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
 @@ -317,6 +317,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_l
@@ -144,10 +144,10 @@ index dab0d8a..fb21892 100644
                  case GGML_GLU_OP_GEGLU_QUICK:  op_str = "geglu_quick";  break;
                  case GGML_GLU_OP_SWIGLU_CLAMP: op_str = "swiglu_clamp"; break;
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index d51e9cf..3494f63 100644
+index da2f0ac..57c284b 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -887,11 +887,14 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
+@@ -888,11 +888,14 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
      [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
  }
  
@@ -162,7 +162,7 @@ index d51e9cf..3494f63 100644
      [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
  }
  
-@@ -1622,6 +1625,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+@@ -1625,6 +1628,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                  case GGML_GLU_OP_GEGLU_QUICK:
                  case GGML_GLU_OP_SWIGLU_CLAMP:
                      return ggml_is_contiguous_1(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
@@ -210,7 +210,7 @@ index b361da9..7cf14bc 100644
  template [[host_name("kernel_swiglu_oai_f16")]] kernel kernel_swiglu_oai_t kernel_swiglu_oai<half>;
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 77fb5b4..92444c2 100644
+index 55305c0..d95ff26 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1310,9 +1310,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
@@ -246,10 +246,10 @@ index 77fb5b4..92444c2 100644
          struct ggml_context * ctx,
          struct ggml_tensor  * a,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 3bb25ca..486f69a 100644
+index d84c9bb..279ce28 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -2677,12 +2677,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2728,12 +2728,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                      const float beta = hparams.situ_beta;
                      const float lb   = hparams.situ_linear_beta;
  

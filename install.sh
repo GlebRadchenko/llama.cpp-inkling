@@ -5,10 +5,10 @@
 #   ./install.sh <release-tag>    another Unsloth release, e.g. the one Studio runs now:
 #                                 ./install.sh "$(jq -r .release_tag ~/.unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json)"
 #
-# Unsloth Studio: Settings -> llama.cpp folder -> <this repo>/bin, then reload the model.
+# Unsloth Studio: Settings -> llama.cpp folder -> <this repo>/bin, speculative decoding Off, then reload the model.
 set -euo pipefail
 
-TAG=${1:-b12651-mix-c7059d6}
+TAG=${1:-b12675-mix-d14fe45}
 ROOT=$(cd "$(dirname "$0")" && pwd)
 GIT=(git -c user.name=inkling -c user.email=inkling@localhost -c commit.gpgsign=false)
 cd "$ROOT"
@@ -52,4 +52,4 @@ echo "$TAG" > "$ROOT/bin/VERSION"
 
 echo
 echo "Done: $ROOT/bin  (Unsloth $TAG + Inkling patches)"
-echo "Unsloth Studio: Settings -> llama.cpp folder -> $ROOT/bin, then reload the model."
+echo "Unsloth Studio: Settings -> llama.cpp folder -> $ROOT/bin, speculative decoding Off, then reload the model."

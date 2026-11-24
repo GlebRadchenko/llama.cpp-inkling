@@ -15,10 +15,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 25 insertions(+), 2 deletions(-)
 
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 486f69a..d2acddd 100644
+index 279ce28..e91bd4a 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1980,7 +1980,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+@@ -2031,7 +2031,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
          const int64_t n_expert = w_s->ne[0];
          const int64_t n_tokens = cur->ne[2];
          ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
@@ -31,10 +31,10 @@ index 486f69a..d2acddd 100644
          res = ggml_mul(ctx0, res, s);
      }
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 365b272..75990bd 100644
+index 39d850f..a215c57 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -190,6 +190,11 @@ void llama_model_inkling2::post_load_data() {
+@@ -202,6 +202,11 @@ void llama_model_inkling2::post_load_data() {
              }
              conv_folded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1], 1, v.data());
          }
@@ -46,7 +46,7 @@ index 365b272..75990bd 100644
      }
  }
  
-@@ -622,9 +627,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -677,9 +682,22 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
              if (v_rot) {
                  cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
              }
@@ -71,7 +71,7 @@ index 365b272..75990bd 100644
              // per-query sink t: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s)))
              table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
 diff --git a/src/models/models.h b/src/models/models.h
-index 25e34b0..d0f8935 100644
+index 33d00e6..00fed97 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -2593,6 +2593,8 @@ struct llama_model_inkling2 : public llama_model_base {

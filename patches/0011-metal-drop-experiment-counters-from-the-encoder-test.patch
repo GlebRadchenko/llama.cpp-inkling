@@ -12,10 +12,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 110 insertions(+), 15 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index 72116a6..43f4570 100644
+index 460f75c..f9d84b9 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -887,14 +887,11 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
+@@ -888,14 +888,11 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
      [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
  }
  
@@ -31,7 +31,7 @@ index 72116a6..43f4570 100644
  }
  
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index 1ad96b4..e4bd223 100644
+index eb35e89..255637f 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -556,18 +556,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
@@ -54,7 +54,7 @@ index 1ad96b4..e4bd223 100644
          GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
                  "https://github.com/ggml-org/llama.cpp/pull/14849");
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e754121..8ae4f40 100644
+index 229341c..d6fcaa1 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -2381,6 +2381,74 @@ struct test_glu_split : public test_case {
@@ -132,7 +132,7 @@ index e754121..8ae4f40 100644
  struct test_swiglu_oai : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne_a;
-@@ -11689,6 +11757,33 @@ static const ggml_type other_types[] = {
+@@ -12059,6 +12127,33 @@ static const ggml_type other_types[] = {
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
@@ -166,7 +166,7 @@ index e754121..8ae4f40 100644
      std::default_random_engine rng(0);
  
      // unary ops
-@@ -11928,7 +12023,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12298,7 +12393,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
          for (int v : {0, 1}) {
              for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
@@ -175,7 +175,7 @@ index e754121..8ae4f40 100644
                      continue;
                  }
  
-@@ -15081,6 +15176,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -15554,6 +15649,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  // Test cases for performance evaluation: should be representative of real-world use cases
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
@@ -194,5 +194,5 @@ index e754121..8ae4f40 100644
 +        return test_cases;
 +    }
  
-     test_cases.emplace_back(new test_timestep_embedding());
-     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
+     // Inkling-2-Mini decode: banded over a padded n_kv vs flash attention with a dense bias mask
+     {

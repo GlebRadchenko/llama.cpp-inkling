@@ -21,11 +21,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  ggml/src/ggml-metal/ggml-metal-ops.h      |   1 +
  ggml/src/ggml-metal/kernels/norm.metal    | 112 ++++++++++++++++++++++
  ggml/src/ggml.c                           |  40 +++++++-
- src/models/inkling2.cpp                   |  28 +-----
- 13 files changed, 333 insertions(+), 25 deletions(-)
+ src/models/inkling2.cpp                   |  30 ++----
+ 13 files changed, 334 insertions(+), 26 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 73fa7cd..12a229f 100644
+index 789bf4d..365dac0 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -451,6 +451,7 @@ extern "C" {
@@ -77,7 +77,7 @@ index 534864a..cf05d7e 100644
          case GGML_OP_DIV:
          case GGML_OP_NORM:
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index dccd259..c68a266 100644
+index 3a46127..375ff7e 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -2908,6 +2908,71 @@ void ggml_compute_forward_silu_back(
@@ -165,10 +165,10 @@ index 22017df..9499cee 100644
  void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index fb21892..e7527f9 100644
+index 4ef7cd3..ae66c29 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -2251,6 +2251,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_met
+@@ -2273,6 +2273,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_met
      return res;
  }
  
@@ -214,10 +214,10 @@ index c0466d6..e12c5db 100644
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index 3494f63..9c12e17 100644
+index 57c284b..185d4d0 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1693,6 +1693,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+@@ -1696,6 +1696,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
              return has_simdgroup_reduction && ggml_is_contiguous(op->src[0]);
          case GGML_OP_TRI:
              return ggml_is_contiguous_rows(op->src[0]);
@@ -263,7 +263,7 @@ index 9b2e87f..803a9c8 100644
      int64_t  ne00;
      int64_t  ne01;
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index 657191d..89986c5 100644
+index a7a1ef6..72afcc8 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -400,6 +400,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -277,7 +277,7 @@ index 657191d..89986c5 100644
          case GGML_OP_L2_NORM:
              {
                  n_fuse = ggml_metal_op_l2_norm(ctx, idx);
-@@ -4588,6 +4592,50 @@ int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
+@@ -4587,6 +4591,50 @@ int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
      return 1;
  }
  
@@ -461,7 +461,7 @@ index 983d9b5..2e55723 100644
 +    }
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 92444c2..787ade0 100644
+index d95ff26..c3c0129 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1151,9 +1151,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -530,10 +530,10 @@ index 92444c2..787ade0 100644
  
  struct ggml_tensor * ggml_sigmoid_back(
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index d936d24..6662ccf 100644
+index 7b53d96..1e15c46 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -245,30 +245,12 @@ const llama_model_inkling2::graph::block_stack * llama_model_inkling2::graph::st
+@@ -257,30 +257,12 @@ const llama_model_inkling2::graph::block_stack * llama_model_inkling2::graph::st
  }
  
  ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il) {
@@ -549,11 +549,7 @@ index d936d24..6662ccf 100644
 -        const block_stack * st = stack(blocks, il);
 -        all.states   = st ? ggml_concat(ctx0, st->states,   normed,   1) : normed;
 -        all.states_t = st ? ggml_concat(ctx0, st->states_t, normed_t, 0) : normed_t;
-+    // rows [blocks.back(), ..., blocks.front(), cur], each RMS-normalized; the blocks are normalized and stacked once per graph
-+    const block_stack * st = stack(blocks, il);
-+    if (!ggml_is_contiguous(cur)) {
-+        cur = ggml_cont(ctx0, cur);
-     }
+-    }
 -    ggml_tensor * states   = all.states;
 -    ggml_tensor * states_t = all.states_t;
 -
@@ -565,6 +561,11 @@ index d936d24..6662ccf 100644
 -    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 -
 -    return ggml_mul_mat(ctx0, states_t, scores);
++    // rows [blocks.back(), ..., blocks.front(), cur], each RMS-normalized; the blocks are normalized and stacked once per graph
++    const block_stack * st = stack(blocks, il);
++    if (!ggml_is_contiguous(cur)) {
++        cur = ggml_cont(ctx0, cur);
++    }
 +    return ggml_depth_mix(ctx0, ggml_reshape_2d(ctx0, cur, n_embd, n_tokens), query, st ? st->states : nullptr, 1.0f/sqrtf(n_embd), 1e-6f);
  }
  

@@ -19,10 +19,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  8 files changed, 215 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index e7527f9..d4e1405 100644
+index ae66c29..66f92f1 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -2277,6 +2277,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_m
+@@ -2299,6 +2299,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_m
      return res;
  }
  
@@ -178,7 +178,7 @@ index 803a9c8..91453d6 100644
      int64_t  ne00;
      int64_t  ne01;
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index 89986c5..dcf4f63 100644
+index 72afcc8..e304c7c 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -565,12 +565,68 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {

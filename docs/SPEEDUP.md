@@ -1,7 +1,7 @@
 # Inkling-2-Mini (UD-Q4_K_XL) speedup on M1 Max
 
 Measured 2026-11-24 on an M1 Max (64 GB). Same GGUF, same quant, same reasoning effort, no loop reduction.
-Base: Unsloth llama.cpp `b12651-mix-c7059d6` (source commit d426a37).
+Base: Unsloth llama.cpp `b12651-mix-c7059d6` (source commit d426a37); ported to `b12675-mix-d14fe45` (see the end).
 
 ## Result
 
@@ -58,6 +58,22 @@ each costing ~5–8 µs of launch/barrier latency. Every patch below removes dis
 - **DSpark speculative decoding is now a net loss**: 24.8 vs 35.0 tok/s (Studio-like). The 2-token verify costs
   43.5 ms vs 28.1 ms for one token (MoE reads experts per token), and prose drafts get rejected often.
 - A Q8_0-experts requant did not help.
+
+## Port to b12675-mix-d14fe45 (2026-11-24)
+
+- Rebased with real 3-way merges (old release tree → new release tree). Conflicts: 0001, 0006, 0009.
+- **0001:** upstream adopted its own LUT-free NVFP4 decode (one nibble at a time). The patch keeps its own kernel
+  (two nibbles per half2) and NR0=4: upstream's kernel measured 35.0 tok/s, this one 36.5 (tg64, A/B).
+- **0006:** upstream dropped the reserve-only dense block (taken) and added a shift for padded banded spans of 2–32
+  tokens; the shift now reads the clip-folded padded table.
+- **0009:** upstream's MoE amax rescale (other archs) kept; the down scale still goes into the router weights.
+- Speed: stock 23.2 → patched 36.5 tok/s (tg64). Studio flags, effort high: 22.7–22.8 → 31.0–33.6 tok/s.
+- Quality: 39/39 op tests; 32-chunk prefill KLD stock 0.00295 vs patched 0.00277 (max 1.82 vs 0.57); 8-chunk
+  decode (ub 1) stock 0.00279 vs patched 0.00274; quiz 10/10 at effort high.
+- 4-chunk KLD is too noisy to compare builds here: stock b12651 → b12675 moved 0.00158 → 0.00128 and single patches
+  moved it ±0.0002 although they are exact rewrites (the conv fold alone: 0.00123 → 0.00141). 32 chunks settle it.
+- DSpark: Studio b12675 enables it by itself (`speculativeType: auto`). Still a loss with the patches: 22.8–28.7
+  vs 31.0–33.6 tok/s; on stock it is roughly neutral (20.0–25.4 vs 22.7–22.8).
 
 ## Caveats
 

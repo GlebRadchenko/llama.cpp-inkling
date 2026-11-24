@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  9 files changed, 72 insertions(+), 13 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 12a229f..4b90f23 100644
+index 365dac0..c11aa26 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -1237,6 +1237,15 @@ extern "C" {
@@ -40,7 +40,7 @@ index 12a229f..4b90f23 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * a,
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index c68a266..65ea06d 100644
+index 375ff7e..60d0a56 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -3641,9 +3641,10 @@ static void ggml_compute_forward_situ_f32(
@@ -57,10 +57,10 @@ index c68a266..65ea06d 100644
              dst_p[k] = act * (lb > 0.0f ? lb*tanhf(u*(1.0f/lb)) : u);
          }
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index 9c12e17..d4fb6cb 100644
+index 185d4d0..cd2506c 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1626,7 +1626,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+@@ -1629,7 +1629,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                  case GGML_GLU_OP_SWIGLU_CLAMP:
                      return ggml_is_contiguous_1(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
                  case GGML_GLU_OP_SITU:
@@ -83,7 +83,7 @@ index 91453d6..be9d65e 100644
  
  typedef struct {
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index dcf4f63..3f46924 100644
+index e304c7c..49ad397 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -552,7 +552,18 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
@@ -152,7 +152,7 @@ index 7cf14bc..3ab34c0 100644
          const float act = (beta*precise::tanh((1.0f/beta)*g)) * (1 / (1 + exp(-g)));
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 787ade0..1d931eb 100644
+index c3c0129..02d8ef9 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -3208,6 +3208,20 @@ struct ggml_tensor * ggml_situ(
@@ -177,10 +177,10 @@ index 787ade0..1d931eb 100644
          struct ggml_context * ctx,
          struct ggml_tensor  * a,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index d2acddd..8de5cac 100644
+index e91bd4a..7d67556 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1959,7 +1959,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+@@ -2011,7 +2011,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
            ggml_tensor * cur, // ggml_tensor * b
            ggml_tensor * ids,
            ggml_tensor * slots,
@@ -188,9 +188,9 @@ index d2acddd..8de5cac 100644
 +                 bool   cached,
 +          ggml_tensor ** s_rows) const {
      ggml_tensor * w_s = model.get_w_scale(w);
- 
      // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
-@@ -1985,7 +1986,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+@@ -2036,7 +2037,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
              s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
          }
          s = ggml_get_rows(ctx0, s, ids);
@@ -203,7 +203,7 @@ index d2acddd..8de5cac 100644
      }
      for (const auto & lora : *loras) {
          llama_adapter_lora_weight * lw = lora.first->get_weight(w);
-@@ -2599,12 +2604,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2650,12 +2655,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
  
      // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
      // ids are the selected experts, for the biases and scales
@@ -224,7 +224,7 @@ index d2acddd..8de5cac 100644
              cb(gate_up, "ffn_moe_gate_up", il);
  
              if (gate_up_exps_b) {
-@@ -2680,7 +2692,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2731,7 +2743,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                      const float beta = hparams.situ_beta;
                      const float lb   = hparams.situ_linear_beta;
  
@@ -233,17 +233,17 @@ index d2acddd..8de5cac 100644
                      cb(cur, "ffn_moe_situ", il);
                  } break;
              case LLM_FFN_GELU:
-@@ -2731,7 +2743,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2784,7 +2796,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
              cur = amax_src1.res;
          }
  
 -        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
 +        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached,
 +                fold_scales && !down_exps_b && !post_exp_norm && !weight_before_ffn ? &down_s : nullptr); // [n_embd, n_expert_used, n_tokens]
-         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
          cb(experts, "ffn_moe_down", il);
  
-@@ -2762,7 +2775,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         if (amax_src1.scale_s) {
+@@ -2814,7 +2827,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      }
  
      if (!weight_before_ffn) {
@@ -254,10 +254,10 @@ index d2acddd..8de5cac 100644
      }
  
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 59731c4..f56c43b 100644
+index a7b4b60..5e4b463 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -1204,12 +1204,14 @@ struct llm_graph_context {
+@@ -1224,12 +1224,14 @@ struct llm_graph_context {
  
      // do mat_mul_id, while optionally apply lora and per-expert scale
      // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)

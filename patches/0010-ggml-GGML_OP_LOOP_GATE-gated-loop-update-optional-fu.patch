@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  14 files changed, 308 insertions(+), 11 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 4b90f23..3cf15be 100644
+index c11aa26..7d938d5 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -452,6 +452,7 @@ extern "C" {
@@ -78,7 +78,7 @@ index cf05d7e..9bd7c7e 100644
          case GGML_OP_DIV:
          case GGML_OP_NORM:
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 65ea06d..6ed802a 100644
+index 60d0a56..69ef22f 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -2973,6 +2973,45 @@ void ggml_compute_forward_depth_mix(
@@ -140,10 +140,10 @@ index 9499cee..ae99519 100644
  void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index d4e1405..3fe7c31 100644
+index 66f92f1..74136b3 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -2295,6 +2295,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_
+@@ -2317,6 +2317,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_
      return res;
  }
  
@@ -176,10 +176,10 @@ index 60d7812..1e98660 100644
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index d4fb6cb..72116a6 100644
+index cd2506c..460f75c 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -1694,6 +1694,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+@@ -1697,6 +1697,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
              return has_simdgroup_reduction && ggml_is_contiguous(op->src[0]);
          case GGML_OP_TRI:
              return ggml_is_contiguous_rows(op->src[0]);
@@ -219,7 +219,7 @@ index be9d65e..03b39ae 100644
      int64_t  ne00;
      int64_t  ne01;
 diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
-index 3f46924..1ad96b4 100644
+index 49ad397..eb35e89 100644
 --- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
 @@ -404,6 +404,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -233,7 +233,7 @@ index 3f46924..1ad96b4 100644
          case GGML_OP_L2_NORM:
              {
                  n_fuse = ggml_metal_op_l2_norm(ctx, idx);
-@@ -4706,6 +4710,56 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx) {
+@@ -4705,6 +4709,56 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx) {
      return 1;
  }
  
@@ -394,7 +394,7 @@ index 2e55723..dbf2bb1 100644
 +    y[i] = (xv - precise::tanh(f[i])*xv) + precise::tanh(f[i + n4])*mr[i];
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 1d931eb..ae21043 100644
+index 02d8ef9..85947ba 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1152,9 +1152,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -461,10 +461,10 @@ index 1d931eb..ae21043 100644
  
  struct ggml_tensor * ggml_sigmoid_back(
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 6662ccf..5230640 100644
+index 1e15c46..0258f3f 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -190,6 +190,20 @@ void llama_model_inkling2::post_load_data() {
+@@ -202,6 +202,20 @@ void llama_model_inkling2::post_load_data() {
              }
              conv_folded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1], 1, v.data());
          }
@@ -485,7 +485,7 @@ index 6662ccf..5230640 100644
          if (ggml_tensor * w = layer.attn_rel_bias; w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w)) {
              // the zero row of the out-of-extent positions, and R's clip factor (R stays unit-norm-clipped)
              std::vector<float> v(w->ne[0]*(w->ne[1] + 1), 0.0f);
-@@ -318,11 +332,21 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+@@ -330,11 +344,21 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
  // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
  // cur_norm and message_norm are cur and message RMS-normalized
  ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
@@ -508,7 +508,7 @@ index 6662ccf..5230640 100644
      if (ggml_tensor * w = loop.ctrl_fg_all) {
          // forget and gain in one matmul: rows [0, n_embd) forget, [n_embd, 2*n_embd) gain
          ggml_tensor * fg = ggml_tanh(ctx0, ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, w->ne[0], w->ne[1], w->nb[1], ctrl*w->nb[2]), gate));
-@@ -475,11 +499,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -537,11 +561,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          ggml_tensor * wf = loop->ctrl_fg_all;
          ggml_tensor * gate = ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wd, wd->ne[0], wd->ne[1], 3, wd->nb[1], wd->nb[2], 0),
                  ggml_concat(ctx0, xn, by_ctrl(messages_norm), 0));
@@ -529,7 +529,7 @@ index 6662ccf..5230640 100644
              // one norm weight for the three inputs
              out = build_norm(out, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
              inputs_normed = true;
-@@ -726,11 +754,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -782,11 +810,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
  
      // MoE
      if (!skip_mix) cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query, il), n_embd, n_tokens);
@@ -547,7 +547,7 @@ index 6662ccf..5230640 100644
      static const bool skip_moe = ink_skip("INK_SKIP_MOE");
      if (!skip_moe) cur = build_moe_ffn(cur,
 diff --git a/src/models/models.h b/src/models/models.h
-index d52174d..ca6bc37 100644
+index ef4b79e..eb3850b 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -2595,6 +2595,8 @@ struct llama_model_inkling2 : public llama_model_base {

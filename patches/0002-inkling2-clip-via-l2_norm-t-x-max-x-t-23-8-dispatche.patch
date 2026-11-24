@@ -12,12 +12,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 14 insertions(+), 16 deletions(-)
 
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index a304e17..46d70a3 100644
+index 61ea554..37901ac 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -3,6 +3,9 @@
- 
+@@ -4,6 +4,9 @@
  #include <algorithm>
+ #include <cstring>
  #include <vector>
 +#include <cstdlib>
 +// profiling ablations (timing only, output is wrong when set)
@@ -25,7 +25,7 @@ index a304e17..46d70a3 100644
  
  // max elements of the dense relative bias per attention call, and max chunks per layer
  static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
-@@ -172,22 +175,13 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const
+@@ -184,22 +187,13 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const
  
  // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
  ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il) {
@@ -52,7 +52,7 @@ index a304e17..46d70a3 100644
  }
  
  // attention over the depth: mix the earlier block outputs and cur with learned queries
-@@ -252,6 +246,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+@@ -264,6 +258,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
          ggml_tensor * history,
          llm_graph_input_rs * inp,
          int64_t offset) {
@@ -60,7 +60,7 @@ index a304e17..46d70a3 100644
      const int64_t n_conv       = hparams.n_shortconv_l_cache;
      const int64_t n_channels   = cur->ne[0];
      const int64_t n_seq_tokens = ubatch.n_seq_tokens;
-@@ -300,6 +295,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+@@ -312,6 +307,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
  // cur_norm and message_norm are cur and message RMS-normalized
  ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
          const loop_layer & loop, int ctrl) {
@@ -68,7 +68,7 @@ index a304e17..46d70a3 100644
      ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
      gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
  
-@@ -412,7 +408,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -474,7 +470,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
  
      // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
      ggml_tensor * inputs[3] = {cur, cur, cur};
@@ -78,7 +78,7 @@ index a304e17..46d70a3 100644
          ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query, il);
          if (is_swa) {
              // one query, already contiguous
-@@ -644,14 +641,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -699,14 +696,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
      cb(ffn_inp, "ffn_inp", il);
  
      // MoE
