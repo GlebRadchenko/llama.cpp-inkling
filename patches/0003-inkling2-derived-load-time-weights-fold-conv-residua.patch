@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Radchenko <14540409+GlebRadchenko@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:15:13 +0100
+Subject: [PATCH 03/11] inkling2: derived load-time weights; fold conv
+ residual+scale into the conv taps; batch q/k/v loop controllers
+
+llama_model::post_load_data()/new_derived_weight() build weights from loaded ones.
+5039 -> 4138 Metal dispatches per decode token, tg 25.4 -> 27.6 tok/s.
+KLD vs CPU reference 0.00131 (stock Metal 0.00158).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-model.cpp          | 26 ++++++++++++
+ src/llama-model.h            |  6 +++
+ src/models/inkling2-loop.cpp | 28 +++++++++++++
+ src/models/inkling2.cpp      | 79 +++++++++++++++++++++++++++++++++++-
+ src/models/models.h          |  8 ++++
+ 5 files changed, 145 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index cd5cd60..cfbd8fc 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2358,11 +2358,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+     load_tensors_hadamard();
+ 
++    post_load_data();
++
+     llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy, w_scales);
+ 
+     return true;
+ }
+ 
++ggml_tensor * llama_model::new_derived_weight(const ggml_tensor * like, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, const void * data) {
++    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(like->buffer);
++    // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
++    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
++        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++            buft = ggml_backend_dev_buffer_type(dev);
++        }
++    }
++    ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
++    ggml_context_ptr ctx { ggml_init(params) };
++    ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), type, ne0, ne1, ne2);
++    ggml_format_name(t, "%s.derived", like->name);
++    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
++    if (!buf) {
++        throw std::runtime_error(format("unable to allocate a derived weight for %s", like->name));
++    }
++    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
++    std::vector<ggml_backend_buffer_ptr> bufs;
++    bufs.emplace_back(std::move(buf));
++    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
++    return t;
++}
++
+ // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
+ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+     uint32_t hadamard_version = 0;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 4211303..1b76b57 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -1122,6 +1122,12 @@ struct llama_model {
+     // optional, runs after the scale pass
+     virtual void post_arch_tensors(llama_model_loader &) {}
+ 
++    // optional, runs once the weights are loaded: build weights derived from them with new_derived_weight()
++    virtual void post_load_data() {}
++
++    // a weight computed at load time, in the buffer type of `like` and owned by the model; data is ne0*ne1*ne2 values of type
++    ggml_tensor * new_derived_weight(const ggml_tensor * like, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, const void * data);
++
+ protected:
+     llama_model_params params;
+ 
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+index db24517..0f31daa 100644
+--- a/src/models/inkling2-loop.cpp
++++ b/src/models/inkling2-loop.cpp
+@@ -119,6 +119,34 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
+     }
+ }
+ 
++void llama_model_inkling2_loop::post_load_data() {
++    llama_model_inkling2::post_load_data();
++
++    const int64_t n_in  = 2*hparams.n_embd;
++    const int64_t rank  = gate_rank;
++    const int64_t n_mat = n_in*rank; // elements of a down, and of a forget plus a gain
++    for (auto & l : loop_layers) {
++        bool ok = true;
++        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
++            for (ggml_tensor * t : { l.ctrl_down[c], l.ctrl_gain[c], l.ctrl_forget[c] }) {
++                ok = ok && t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
++            }
++        }
++        if (!ok) {
++            continue;
++        }
++        std::vector<float> down(LOOP_CTRL_COUNT*n_mat);
++        std::vector<float> fg(LOOP_CTRL_COUNT*n_mat);
++        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
++            ggml_backend_tensor_get(l.ctrl_down[c],   down.data() + c*n_mat,            0, ggml_nbytes(l.ctrl_down[c]));
++            ggml_backend_tensor_get(l.ctrl_forget[c], fg.data()   + c*n_mat,            0, ggml_nbytes(l.ctrl_forget[c]));
++            ggml_backend_tensor_get(l.ctrl_gain[c],   fg.data()   + c*n_mat + n_mat/2,  0, ggml_nbytes(l.ctrl_gain[c]));
++        }
++        l.ctrl_down_all = new_derived_weight(l.ctrl_down[0],   GGML_TYPE_F32, n_in, rank, LOOP_CTRL_COUNT, down.data());
++        l.ctrl_fg_all   = new_derived_weight(l.ctrl_forget[0], GGML_TYPE_F32, rank, n_in, LOOP_CTRL_COUNT, fg.data());
++    }
++}
++
+ void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
+     // share the physical weights, each cache slot keeps its own KV and conv state
+     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 46d70a3..365b272 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -169,6 +169,30 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
+     }
+ }
+ 
++void llama_model_inkling2::post_load_data() {
++    const int64_t n_conv = hparams.n_shortconv_l_cache;
++    const float   scale  = 1.0f/sqrtf(n_conv + 1);
++    for (int il = 0; il < n_layer_phys(); ++il) {
++        const auto & layer = layers[il];
++        // the K and V convolutions of the full-attention layers add dynamic taps, they stay unfolded
++        const bool swa = hparams.is_swa(il);
++        for (ggml_tensor * w : { swa ? layer.attn_k_conv : nullptr, swa ? layer.attn_v_conv : nullptr, layer.attn_post_conv, layer.ffn_post_conv }) {
++            if (!w || w->type != GGML_TYPE_F32 || w->ne[0] != n_conv || !ggml_is_contiguous(w) || conv_folded.count(w)) {
++                continue;
++            }
++            std::vector<float> v(ggml_nelements(w));
++            ggml_backend_tensor_get(w, v.data(), 0, ggml_nbytes(w));
++            for (int64_t c = 0; c < w->ne[1]; ++c) {
++                v[c*n_conv + n_conv - 1] += 1.0f;
++            }
++            for (float & x : v) {
++                x *= scale;
++            }
++            conv_folded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1], 1, v.data());
++        }
++    }
++}
++
+ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const llm_graph_params & params) const {
+     return std::make_unique<graph>(params);
+ }
+@@ -265,6 +289,13 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ 
+     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+ 
++    if (!dynamic) {
++        const auto & folded = static_cast<const llama_model_inkling2 &>(model).conv_folded;
++        if (auto it = folded.find(weight); it != folded.end()) {
++            return ggml_reshape_2d(ctx0, ggml_ssm_conv(ctx0, x, it->second), n_channels, n_tokens);
++        }
++    }
++
+     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
+     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+ 
+@@ -299,6 +330,14 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
+     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
+     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+ 
++    if (ggml_tensor * w = loop.ctrl_fg_all) {
++        // forget and gain in one matmul: rows [0, n_embd) forget, [n_embd, 2*n_embd) gain
++        ggml_tensor * fg = ggml_tanh(ctx0, ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, w->ne[0], w->ne[1], w->nb[1], ctrl*w->nb[2]), gate));
++        ggml_tensor * forget = ggml_view_2d(ctx0, fg, n_embd, fg->ne[1], fg->nb[1], 0);
++        ggml_tensor * gain   = ggml_view_2d(ctx0, fg, n_embd, fg->ne[1], fg->nb[1], n_embd*ggml_element_size(fg));
++        return ggml_add(ctx0, ggml_sub(ctx0, cur, ggml_mul(ctx0, forget, cur)), ggml_mul(ctx0, gain, message));
++    }
++
+     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
+     ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_forget[ctrl], gate));
+ 
+@@ -408,9 +447,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
+     ggml_tensor * inputs[3] = {cur, cur, cur};
++    ggml_tensor * mixed3 = nullptr; // the three mixed inputs of a full-attention layer, [n_embd, 3, n_tokens]
+     static const bool skip_mix = ink_skip("INK_SKIP_MIX");
+     if (layer.attn_res_query && !skip_mix) {
+         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query, il);
++        mixed3 = is_swa ? nullptr : mixed;
+         if (is_swa) {
+             // one query, already contiguous
+             inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
+@@ -421,7 +462,39 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         }
+     }
+ 
+-    if (messages) {
++    bool inputs_normed = false;
++    const bool shared = inputs[0] == inputs[1] && inputs[1] == inputs[2];
++    if (messages && loop->ctrl_down_all && loop->ctrl_fg_all && (shared || mixed3)) {
++        // the q, k and v controllers batched over dim 2: one concat, one down and one forget/gain matmul for all three
++        const auto by_ctrl = [&](ggml_tensor * t) { // [n_embd, >= 3, n_tokens] -> [n_embd, n_tokens, 3]
++            return ggml_permute(ctx0, ggml_view_3d(ctx0, t, n_embd, 3, n_tokens, t->nb[1], t->nb[2], 0), 0, 2, 1, 3);
++        };
++        ggml_tensor * x;  // unnormalized inputs, [n_embd, n_tokens, 1] when shared, else [n_embd, n_tokens, 3]
++        ggml_tensor * xn; // normalized, [n_embd, n_tokens, 3]
++        if (shared) {
++            x  = ggml_reshape_3d(ctx0, inputs[0], n_embd, n_tokens, 1);
++            xn = ggml_repeat(ctx0, ggml_rms_norm(ctx0, x, 1e-6f), ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 3));
++        } else {
++            x  = by_ctrl(mixed3);
++            xn = by_ctrl(ggml_rms_norm(ctx0, mixed3, 1e-6f));
++        }
++        ggml_tensor * wd = loop->ctrl_down_all;
++        ggml_tensor * wf = loop->ctrl_fg_all;
++        ggml_tensor * gate = ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wd, wd->ne[0], wd->ne[1], 3, wd->nb[1], wd->nb[2], 0),
++                ggml_concat(ctx0, xn, by_ctrl(messages_norm), 0));
++        ggml_tensor * fg = ggml_tanh(ctx0, ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wf, wf->ne[0], wf->ne[1], 3, wf->nb[1], wf->nb[2], 0), gate));
++        ggml_tensor * forget = ggml_view_3d(ctx0, fg, n_embd, n_tokens, 3, fg->nb[1], fg->nb[2], 0);
++        ggml_tensor * gain   = ggml_view_3d(ctx0, fg, n_embd, n_tokens, 3, fg->nb[1], fg->nb[2], n_embd*ggml_element_size(fg));
++        ggml_tensor * out = ggml_add(ctx0, ggml_sub(ctx0, ggml_mul(ctx0, gain, by_ctrl(messages)), ggml_mul(ctx0, forget, x)), x);
++        if (is_swa) {
++            // one norm weight for the three inputs
++            out = build_norm(out, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++            inputs_normed = true;
++        }
++        for (int j = 0; j < 3; ++j) {
++            inputs[j] = ggml_view_2d(ctx0, out, n_embd, n_tokens, out->nb[1], j*out->nb[2]);
++        }
++    } else if (messages) {
+         // the messages make the Q, K and V inputs of a SWA layer differ
+         ggml_tensor * inputs_norm[3] = {};
+         for (int j = 0; j < 3; ++j) {
+@@ -434,7 +507,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         }
+     }
+ 
+-    if (is_swa && messages) {
++    if (inputs_normed) {
++        // normalized with the batched controllers
++    } else if (is_swa && messages) {
+         for (int j = 0; j < 3; ++j) {
+             inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+         }
+diff --git a/src/models/models.h b/src/models/models.h
+index e41881f..25e34b0 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2585,8 +2585,15 @@ struct llama_model_inkling2 : public llama_model_base {
+         ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
+         ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
+         ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
++        // derived at load: the downs stacked [2*n_embd, rank, LOOP_CTRL_COUNT], and forget over gain [rank, 2*n_embd, LOOP_CTRL_COUNT]
++        ggml_tensor * ctrl_down_all = nullptr;
++        ggml_tensor * ctrl_fg_all   = nullptr;
+     };
+ 
++    void post_load_data() override;
++    // derived at load: (cur + conv(x, w))*s as one conv, by source weight (the current input is the last tap)
++    std::unordered_map<const ggml_tensor *, ggml_tensor *> conv_folded;
++
+     struct graph : public llm_graph_context {
+         graph(const llm_graph_params & params);
+         // il: the layer whose device runs the mix (the shared stacks are kept per device), -1 if unknown
+@@ -2653,6 +2660,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+     void post_arch_tensors(llama_model_loader & ml) override;
++    void post_load_data() override;
+ 
+     int n_layer_phys() const override { return n_phys; }
+     int layer_phys(int il) const;

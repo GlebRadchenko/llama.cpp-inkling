@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Radchenko <14540409+GlebRadchenko@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:15:14 +0100
+Subject: [PATCH 08/11] metal: fuse CONCAT + CPY + SSM_CONV (short conv with
+ its state store); inkling2: legacy message queries stacked at load
+
+2969 -> 2586 dispatches per decode token, A/B tg64 33.5 -> 35.1 tok/s. Bit-exact: KLD vs CPU unchanged (0.001285 ub 512, 0.001206 ub 1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 18 ++++++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |  1 +
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 54 ++++++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-fusion.h   |  1 +
+ ggml/src/ggml-metal/ggml-metal-impl.h     | 16 +++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 56 +++++++++++++++++++++++
+ ggml/src/ggml-metal/kernels/ssm.metal     | 50 ++++++++++++++++++++
+ src/models/inkling2-loop.cpp              | 22 +++++++--
+ 8 files changed, 215 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index e7527f9..d4e1405 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -2277,6 +2277,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix(ggml_m
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_metal_library_t lib, int32_t nc) {
++    const char * base = "kernel_conv_state_f32";
++
++    char name[256];
++    snprintf(name, 256, "%s_nc=%d", base, nc);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++        ggml_metal_cv_set_bool (cv, false, FC_SSM_CONV + 1);
++        ggml_metal_cv_set_int32(cv, nc,    FC_SSM_CONV + 2);
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++        ggml_metal_cv_free(cv);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
+     assert(op->op == GGML_OP_GROUP_NORM);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index e12c5db..60d7812 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -160,6 +160,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one           (ggml_metal_library_t lib, enum ggml_op op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix         (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state        (ggml_metal_library_t lib, int32_t nc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index 7b55a30..fa610bb 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -286,6 +286,57 @@ static bool ggml_metal_fusion_check_gdn_cache(
+     return true;
+ }
+ 
++// CONCAT + CPY + SSM_CONV: x = [past, input^T] along the window, the cpy stores the last nc - 1 columns of x into the
++// recurrent state, the conv reads x. the fused kernel never materializes x
++static bool ggml_metal_fusion_check_conv_state(
++        const ggml_metal_fusion       * fusion,
++        const ggml_tensor * const     * nodes,
++        const ggml_cgraph             * gf,
++        const int                     * node_idxs,
++              int                       idx,
++              ggml_metal_fusion_mode    mode) {
++    GGML_UNUSED(fusion);
++    GGML_UNUSED(gf);
++    GGML_UNUSED(node_idxs);
++    GGML_UNUSED(idx);
++    GGML_UNUSED(mode);
++
++    const ggml_tensor * cat  = nodes[0];
++    const ggml_tensor * cpy  = nodes[1];
++    const ggml_tensor * conv = nodes[2];
++
++    if (cat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cat, 0) != 0 || (cat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++    const ggml_tensor * past = cat->src[0];
++    const ggml_tensor * inp  = cat->src[1];
++    const ggml_tensor * w    = conv->src[1];
++    if (past->type != GGML_TYPE_F32 || inp->type != GGML_TYPE_F32 || past->nb[0] != sizeof(float) || cat->ne[3] != 1) {
++        return false;
++    }
++    const int64_t nc = w->ne[0];
++    if (conv->src[0] != cat || conv->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
++            nc < 2 || nc > 8 || past->ne[0] != nc - 1 || w->ne[1] != cat->ne[1]) {
++        return false;
++    }
++    const int64_t n_t = inp->ne[0];
++
++    // the cpy stores the last nc - 1 columns of x
++    const ggml_tensor * last = cpy->src[0];
++    const ggml_tensor * cell = cpy->src[1];
++    if ((cpy->flags & GGML_TENSOR_FLAG_OUTPUT) || last->view_src != cat || last->view_offs != n_t*sizeof(float) ||
++            last->ne[0] != nc - 1 || last->ne[1] != cat->ne[1] || last->ne[2] != cat->ne[2] || last->ne[3] != 1 ||
++            last->nb[1] != cat->nb[1] || last->nb[2] != cat->nb[2]) {
++        return false;
++    }
++    if (cell->type != GGML_TYPE_F32 || cell->nb[0] != sizeof(float) || cell->ne[0] != (nc - 1)*cat->ne[1] ||
++            cell->ne[1] != cat->ne[2] || cell->ne[2] != 1 || cell->ne[3] != 1) {
++        return false;
++    }
++
++    return true;
++}
++
+ // MUL + SIN + SQR + MUL + ADD (snake activation)
+ static bool ggml_metal_fusion_check_snake(
+         const ggml_metal_fusion       * fusion,
+@@ -831,6 +882,7 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
+ static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
+ 
+ static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
++static const std::vector<ggml_op> ops_conv_state    = { GGML_OP_CONCAT, GGML_OP_CPY, GGML_OP_SSM_CONV };
+ 
+ static const std::vector<ggml_op> ops_moe_reduce_2 = {
+     GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_ADD
+@@ -911,6 +963,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_SSM_CONV_SILU, ops_ssm_conv_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
+ 
+     { GGML_METAL_FUSION_MUL_MAT_ADD, ops_mul_mat_add, {}, false, ggml_metal_fusion_check_mul_mat_add },
++
++    { GGML_METAL_FUSION_CONV_STATE, ops_conv_state, {}, true, ggml_metal_fusion_check_conv_state },
+ };
+ 
+ // ---- alloc deps -----------------------------------------------------------
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 5d994c2..13b0f46 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -43,6 +43,7 @@ typedef enum ggml_metal_fusion_id {
+     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
+     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
+     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
++    GGML_METAL_FUSION_CONV_STATE,   // CONCAT + CPY + SSM_CONV (short conv over [state, input] and the state store)
+ } ggml_metal_fusion_id;
+ 
+ struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 803a9c8..91453d6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -691,6 +691,22 @@ typedef struct {
+     float    eps;
+ } ggml_metal_kargs_depth_mix;
+ 
++typedef struct {
++    int32_t  n_ch;  // channels
++    int32_t  n_t;   // tokens per sequence
++    uint64_t nbp1;  // past, per channel (contiguous along the window)
++    uint64_t nbp2;  // past, per sequence
++    uint64_t nbi0;  // input, per token
++    uint64_t nbi1;  // input, per channel
++    uint64_t nbi2;  // input, per sequence
++    uint64_t nbw1;  // weight, per channel
++    uint64_t nb1;   // dst, per token
++    uint64_t nb2;   // dst, per sequence
++    uint64_t nbs1;  // state cell, per sequence
++    uint64_t nbx1;  // x = the concat, per channel (contiguous along the window)
++    uint64_t nbx2;  // x, per sequence
++} ggml_metal_kargs_conv_state;
++
+ typedef struct {
+     int64_t  ne00;
+     int64_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 89986c5..dcf4f63 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -565,12 +565,68 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+     return res;
+ }
+ 
++// CONCAT + CPY + SSM_CONV (GGML_METAL_FUSION_CONV_STATE): one thread per channel and sequence slides the conv window
++// over [past, input], writes the conv output and stores the last nc - 1 window values into the state cell; x itself is
++// written too, other nodes may read it (the dynamic taps of the full-attention layers do)
++static int ggml_metal_op_conv_state(ggml_metal_op_t ctx, int idx) {
++    const ggml_tensor * cat  = ctx->node(idx);
++    const ggml_tensor * cpy  = ctx->node(idx + 1);
++    const ggml_tensor * conv = ctx->node(idx + 2);
++
++    const ggml_tensor * past = cat->src[0];
++    const ggml_tensor * inp  = cat->src[1];
++    const ggml_tensor * w    = conv->src[1];
++    const ggml_tensor * cell = cpy->src[1];
++
++    ggml_metal_kargs_conv_state args = {
++        /*.n_ch =*/ (int32_t) cat->ne[1],
++        /*.n_t  =*/ (int32_t) inp->ne[0],
++        /*.nbp1 =*/ past->nb[1],
++        /*.nbp2 =*/ past->nb[2],
++        /*.nbi0 =*/ inp->nb[0],
++        /*.nbi1 =*/ inp->nb[1],
++        /*.nbi2 =*/ inp->nb[2],
++        /*.nbw1 =*/ w->nb[1],
++        /*.nb1  =*/ conv->nb[1],
++        /*.nb2  =*/ conv->nb[2],
++        /*.nbs1 =*/ cell->nb[1],
++        /*.nbx1 =*/ cat->nb[1],
++        /*.nbx2 =*/ cat->nb[2],
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_conv_state(ctx->lib, (int32_t) w->ne[0]);
++
++    ggml_metal_encoder_t enc = ctx->enc;
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(past), 1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(inp),  2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),    3);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(conv), 4);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cell), 5);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cat),  6);
++
++    const int nth = 256;
++    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_ch + nth - 1)/nth, cat->ne[2], 1, nth, 1, 1);
++
++    return 3;
++}
++
+ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
++    if (ctx->use_fusion()) {
++        int n = 1;
++        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
++        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_CONV_STATE) {
++            ctx->count_fusions(fusion);
++            return ggml_metal_op_conv_state(ctx, idx);
++        }
++    }
++
+     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+diff --git a/ggml/src/ggml-metal/kernels/ssm.metal b/ggml/src/ggml-metal/kernels/ssm.metal
+index b21c53b..736bc88 100644
+--- a/ggml/src/ggml-metal/kernels/ssm.metal
++++ b/ggml/src/ggml-metal/kernels/ssm.metal
+@@ -474,3 +474,53 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
+         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+     }
+ }
++
++// short conv over [past, input] with the state store (GGML_METAL_FUSION_CONV_STATE): one thread per channel and sequence
++kernel void kernel_conv_state_f32(
++        constant ggml_metal_kargs_conv_state & args,
++        device const char * past,
++        device const char * inp,
++        device const char * w,
++        device       char * dst,
++        device       char * state,
++        device       char * x,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]]) {
++    const int c = tgpig.x*ntg.x + tpitg.x;
++    const int s = tgpig.y;
++    if (c >= args.n_ch) {
++        return;
++    }
++
++    const int nc = FC_ssm_conv_nc;
++
++    float win[8];
++    device const float * p  = (device const float *) (past + c*args.nbp1 + s*args.nbp2);
++    device       float * xc = (device       float *) (x    + c*args.nbx1 + s*args.nbx2);
++    for (int k = 0; k < nc - 1; ++k) {
++        win[k] = p[k];
++        xc[k]  = win[k];
++    }
++    device const float * wc = (device const float *) (w + c*args.nbw1);
++
++    for (int t = 0; t < args.n_t; ++t) {
++        win[nc - 1] = *((device const float *) (inp + t*args.nbi0 + c*args.nbi1 + s*args.nbi2));
++        xc[nc - 1 + t] = win[nc - 1];
++
++        float sumf = 0.0f;
++        for (int k = 0; k < nc; ++k) {
++            sumf += win[k] * wc[k];
++        }
++        *((device float *) (dst + c*sizeof(float) + t*args.nb1 + s*args.nb2)) = sumf;
++
++        for (int k = 0; k < nc - 1; ++k) {
++            win[k] = win[k + 1];
++        }
++    }
++
++    device float * st = (device float *) (state + s*args.nbs1) + c*(nc - 1);
++    for (int k = 0; k < nc - 1; ++k) {
++        st[k] = win[k];
++    }
++}
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+index 0f31daa..e957f99 100644
+--- a/src/models/inkling2-loop.cpp
++++ b/src/models/inkling2-loop.cpp
+@@ -122,9 +122,25 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
+ void llama_model_inkling2_loop::post_load_data() {
+     llama_model_inkling2::post_load_data();
+ 
+-    const int64_t n_in  = 2*hparams.n_embd;
+-    const int64_t rank  = gate_rank;
+-    const int64_t n_mat = n_in*rank; // elements of a down, and of a forget plus a gain
++    const int64_t n_embd = hparams.n_embd;
++    const int64_t n_in   = 2*n_embd;
++    const int64_t rank   = gate_rank;
++    const int64_t n_mat  = n_in*rank; // elements of a down, and of a forget plus a gain
++
++    // legacy layout: the q, k, v and ffn message queries of each core layer stacked once, see legacy_query()
++    if (legacy && legacy_res_query->type == GGML_TYPE_F32 && legacy_kv_res_query->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(legacy_res_query) && ggml_is_contiguous(legacy_kv_res_query)) {
++        const size_t row = n_embd*sizeof(float);
++        std::vector<float> q(LOOP_CTRL_COUNT*n_embd);
++        for (size_t i = 0; i < loop_layers.size(); ++i) {
++            ggml_backend_tensor_get(legacy_res_query,    q.data() + 0*n_embd, (2*i + 0)*row, row);
++            ggml_backend_tensor_get(legacy_kv_res_query, q.data() + 1*n_embd, (2*i + 0)*row, row);
++            ggml_backend_tensor_get(legacy_kv_res_query, q.data() + 2*n_embd, (2*i + 1)*row, row);
++            ggml_backend_tensor_get(legacy_res_query,    q.data() + 3*n_embd, (2*i + 1)*row, row);
++            loop_layers[i].msg_query = new_derived_weight(legacy_res_query, GGML_TYPE_F32, n_embd, LOOP_CTRL_COUNT, 1, q.data());
++        }
++    }
++
+     for (auto & l : loop_layers) {
+         bool ok = true;
+         for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {

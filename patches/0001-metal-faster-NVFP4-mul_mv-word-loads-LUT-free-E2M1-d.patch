@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Radchenko <14540409+GlebRadchenko@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:15:12 +0100
+Subject: [PATCH 01/11] metal: faster NVFP4 mul_mv (word loads, LUT-free E2M1
+ decode, NR0=4); KLD-verified
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-impl.h    |  2 +-
+ ggml/src/ggml-metal/kernels/mul_mv.metal | 35 +++++++++++++++---------
+ 2 files changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 4e28b2c..9b2e87f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -50,7 +50,7 @@
+ #define N_R0_MXFP4 2
+ #define N_SG_MXFP4 2
+ 
+-#define N_R0_NVFP4 2
++#define N_R0_NVFP4 4
+ #define N_SG_NVFP4 2
+ 
+ #define N_R0_Q2_K 4
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 49a31e4..d05e06d 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3151,6 +3151,16 @@ kernel void kernel_mul_mv_mxfp4_f32(
+     kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+ }
+ 
++// 4 E2M1 nibbles (one per byte of x, values 0..15) -> their values times 2^-14, exact:
++// the nibble's magnitude bits are an fp16 exponent/mantissa pair, its sign bit the fp16 sign
++static inline float4 nvfp4_e2m1x4_scaled(uint32_t x) {
++    const uint32_t e = x & 0x00FF00FFu;        // bytes 0 and 2 in the two 16-bit lanes
++    const uint32_t o = (x >> 8) & 0x00FF00FFu; // bytes 1 and 3
++    const half2 a = as_type<half2>(((e & 0x00080008u) << 12) | ((e & 0x00070007u) << 9));
++    const half2 b = as_type<half2>(((o & 0x00080008u) << 12) | ((o & 0x00070007u) << 9));
++    return float4(a[0], b[0], a[1], b[1]);
++}
++
+ template<int NR0, typename args_t>
+ void kernel_mul_mv_nvfp4_f32_impl(
+         args_t args,
+@@ -3163,8 +3173,6 @@ void kernel_mul_mv_nvfp4_f32_impl(
+         ushort sgitg) {
+     const short NSG = FC_mul_mv_nsg;
+ 
+-    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+-
+     const int r0 = tgpig.x;
+     const int r1 = tgpig.y;
+     const int im = tgpig.z;
+@@ -3186,9 +3194,6 @@ void kernel_mul_mv_nvfp4_f32_impl(
+     const short ix = tiisg/2;  // 0...15
+     const short it = tiisg%2;  // 0 or 1, each thread takes 2 of the 4 sub-blocks
+ 
+-    shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
+-
+     float4 yl[8];
+     float sumf[NR0]={0.f};
+ 
+@@ -3203,21 +3208,24 @@ void kernel_mul_mv_nvfp4_f32_impl(
+ 
+         FOR_UNROLL (short row = 0; row < NR0; row++) {
+             device const block_nvfp4 & xb = x[row*ns01 + ib];
+-            device const uint8_t     * q2 = xb.qs + 2*it*(QK_NVFP4_SUB/2);
++            // a block is 36 bytes, so its scales and quants are 4-byte aligned: word loads, not byte loads
++            device const uint32_t * q32 = (device const uint32_t *) (xb.qs + 2*it*(QK_NVFP4_SUB/2));
++            const uint32_t sc = *((device const uint32_t *) xb.d) >> (16*it);
+ 
+             float sumq = 0.f;
+ 
+             FOR_UNROLL (short s = 0; s < 2; ++s) {
+-                device const uint8_t * q = q2 + 8*s;
++                const uint32_t w0 = q32[2*s + 0]; // quants 0..3: low nibbles are elements 0..3, high 8..11
++                const uint32_t w1 = q32[2*s + 1]; // quants 4..7: low nibbles are elements 4..7, high 12..15
+ 
+-                float4 acc1 = yl[4*s + 0]*float4(shmem_f32[q[0] &  0x0F], shmem_f32[q[1] &  0x0F], shmem_f32[q[2] &  0x0F], shmem_f32[q[3] &  0x0F]);
+-                float4 acc2 = yl[4*s + 1]*float4(shmem_f32[q[4] &  0x0F], shmem_f32[q[5] &  0x0F], shmem_f32[q[6] &  0x0F], shmem_f32[q[7] &  0x0F]);
+-                float4 acc3 = yl[4*s + 2]*float4(shmem_f32[q[0] >> 4   ], shmem_f32[q[1] >> 4   ], shmem_f32[q[2] >> 4   ], shmem_f32[q[3] >> 4   ]);
+-                float4 acc4 = yl[4*s + 3]*float4(shmem_f32[q[4] >> 4   ], shmem_f32[q[5] >> 4   ], shmem_f32[q[6] >> 4   ], shmem_f32[q[7] >> 4   ]);
++                float4 acc1 = yl[4*s + 0]*nvfp4_e2m1x4_scaled( w0       & 0x0F0F0F0Fu);
++                float4 acc2 = yl[4*s + 1]*nvfp4_e2m1x4_scaled( w1       & 0x0F0F0F0Fu);
++                float4 acc3 = yl[4*s + 2]*nvfp4_e2m1x4_scaled((w0 >> 4) & 0x0F0F0F0Fu);
++                float4 acc4 = yl[4*s + 3]*nvfp4_e2m1x4_scaled((w1 >> 4) & 0x0F0F0F0Fu);
+ 
+                 acc1 = (acc1 + acc3) + (acc2 + acc4);
+ 
+-                sumq += ue4m3_to_fp32(xb.d[2*it + s]) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
++                sumq += ue4m3_to_fp32((uint8_t) (sc >> (8*s))) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+             }
+ 
+             sumf[row] += sumq;
+@@ -3229,7 +3237,8 @@ void kernel_mul_mv_nvfp4_f32_impl(
+     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+ 
+     for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+-        float sum_all = simd_sum(sumf[row]);
++        // the nibbles were decoded times 2^-14
++        float sum_all = simd_sum(sumf[row]) * 16384.0f;
+         if (tiisg == 0) {
+             dst_f32[first_row + row] = sum_all;
+         }

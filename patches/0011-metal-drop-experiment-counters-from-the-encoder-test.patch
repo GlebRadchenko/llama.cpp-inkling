@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Radchenko <14540409+GlebRadchenko@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:15:15 +0100
+Subject: [PATCH 11/11] metal: drop experiment counters from the encoder;
+ tests: Inkling op and perf cases (INK_EVAL, INK_PERF)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-device.m |   3 -
+ ggml/src/ggml-metal/ggml-metal-ops.cpp  |  11 ---
+ tests/test-backend-ops.cpp              | 111 +++++++++++++++++++++++-
+ 3 files changed, 110 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 72116a6..43f4570 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -887,14 +887,11 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
+     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
+ }
+ 
+-int ggml_metal_n_dispatch = 0, ggml_metal_n_barrier = 0; // experiment: counters for GGML_METAL_TIMING
+ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+-    ggml_metal_n_dispatch++;
+     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+ }
+ 
+ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+-    ggml_metal_n_barrier++;
+     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 1ad96b4..e4bd223 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -556,18 +556,7 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
+     }
+ 
+-    extern int ggml_metal_n_dispatch;
+-    const int n_disp0 = ggml_metal_n_dispatch;
+     int res = ggml_metal_op_encode_impl(ctx, idx);
+-    {
+-        // experiment: GGML_METAL_TIMING=5 prints the dispatches of the encode calls of one big graph, keyed by op (+ fused span)
+-        static int mode = -1; if (mode < 0) { const char * e = getenv("GGML_METAL_TIMING"); mode = e ? atoi(e) : 0; }
+-        if (mode == 5 && ctx->n_nodes() > 3000 && ggml_metal_n_dispatch > n_disp0) {
+-            const ggml_tensor * t = ctx->node(idx);
+-            fprintf(stderr, "enc %-14s span=%d disp=%d %s\n", t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : ggml_op_name(t->op),
+-                res, ggml_metal_n_dispatch - n_disp0, t->name);
+-        }
+-    }
+     if (idx + res > ctx->n_nodes()) {
+         GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
+                 "https://github.com/ggml-org/llama.cpp/pull/14849");
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e754121..8ae4f40 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2381,6 +2381,74 @@ struct test_glu_split : public test_case {
+     }
+ };
+ 
++// GGML_GLU_OP_SITU: softcapped SwiGLU of Inkling2 MoE, a and b strided views of one gate_up row like the model
++// GGML_OP_DEPTH_MIX
++struct test_depth_mix : public test_case {
++    const int64_t n_embd, n_q, n_b, n_tok;
++
++    std::string vars() override { return VARS_TO_STR4(n_embd, n_q, n_b, n_tok); }
++
++    test_depth_mix(int64_t n_embd = 2304, int64_t n_q = 1, int64_t n_b = 3, int64_t n_tok = 1) : n_embd(n_embd), n_q(n_q), n_b(n_b), n_tok(n_tok) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
++        ggml_tensor * qry = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_q);
++        ggml_tensor * st  = n_b ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_b, n_tok) : nullptr;
++        return ggml_depth_mix(ctx, cur, qry, st, 1.0f/sqrtf(n_embd), 1e-6f);
++    }
++};
++
++// GGML_OP_LOOP_GATE
++struct test_loop_gate : public test_case {
++    const int64_t E, n, B;
++    const bool bx, bw, nonorm;
++
++    std::string vars() override { return VARS_TO_STR6(E, n, B, bx, bw, nonorm); }
++
++    test_loop_gate(int64_t E = 2304, int64_t n = 1, int64_t B = 3, bool bx = true, bool bw = true, bool nonorm = false) : E(E), n(n), B(B), bx(bx), bw(bw), nonorm(nonorm) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * fg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*E, n, B);
++        ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, n, bx ? 1 : B);
++        // m as a permuted view, like the messages of the model
++        ggml_tensor * mm = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, B + 1, n);
++        ggml_tensor * m  = ggml_permute(ctx, ggml_view_3d(ctx, mm, E, B, n, mm->nb[1], mm->nb[2], 0), 0, 2, 1, 3);
++        ggml_tensor * w  = nonorm ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, bw ? 1 : B);
++        return ggml_loop_gate(ctx, fg, x, m, w, 1e-6f);
++    }
++};
++
++struct test_situ : public test_case {
++    const std::array<int64_t, 4> ne_a;
++    float beta;
++    float lb;
++
++    std::string vars() override { return VARS_TO_STR4(ne_a, beta, lb, scaled); }
++
++    bool scaled;
++
++    test_situ(std::array<int64_t, 4> ne_a = {1152, 8, 2, 1}, float beta = 4.0f, float lb = 25.0f, bool scaled = false) : ne_a(ne_a), beta(beta), lb(lb), scaled(scaled) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        auto ne = ne_a; ne[0] *= 2;
++        ggml_tensor * gu = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_param(gu);
++        ggml_tensor * a = ggml_view_4d(ctx, gu, ne_a[0], ne_a[1], ne_a[2], ne_a[3], gu->nb[1], gu->nb[2], gu->nb[3], 0);
++        ggml_tensor * b = ggml_view_4d(ctx, gu, ne_a[0], ne_a[1], ne_a[2], ne_a[3], gu->nb[1], gu->nb[2], gu->nb[3], ne_a[0]*ggml_element_size(gu));
++        if (scaled) {
++            ggml_tensor * rs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, ne_a[1], ne_a[2], ne_a[3]);
++            return ggml_situ_scaled(ctx, a, b, rs, beta, lb);
++        }
++        return ggml_situ(ctx, a, b, beta, lb);
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t, -60.f, 60.f); // past both softcaps
++        }
++    }
++};
++
+ struct test_swiglu_oai : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+@@ -11689,6 +11757,33 @@ static const ggml_type other_types[] = {
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++    if (getenv("INK_EVAL")) { // Inkling clip shapes and situ
++        test_cases.emplace_back(new test_situ());
++        for (int64_t n : {1, 2}) {
++            test_cases.emplace_back(new test_loop_gate(2304, n, 3, true,  true));
++            test_cases.emplace_back(new test_loop_gate(2304, n, 3, false, false));
++            test_cases.emplace_back(new test_loop_gate(2304, n, 1, false, true));
++            test_cases.emplace_back(new test_loop_gate(2304, n, 3, true,  true, true));
++            test_cases.emplace_back(new test_loop_gate(2304, n, 3, false, true, true));
++        }
++        for (int64_t n_q : {1, 3, 4}) {
++            for (int64_t n_b : {0, 1, 5}) {
++                for (int64_t n_tok : {1, 3}) {
++                    test_cases.emplace_back(new test_depth_mix(2304, n_q, n_b, n_tok));
++                }
++            }
++        }
++        test_cases.emplace_back(new test_depth_mix(256, 4, 8, 7));
++        test_cases.emplace_back(new test_situ({1152, 8, 2, 1}, 4.0f, 0.0f));
++        test_cases.emplace_back(new test_situ({64, 3, 5, 1}, 2.5f, 7.0f));
++        test_cases.emplace_back(new test_situ({1152, 8, 2, 1}, 4.0f, 25.0f, true));
++        for (float eps : {22.627417f, 8.0f}) {
++            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 24, 2, 1}, eps));
++            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 8, 2, 1}, eps));
++            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {16, 24, 2, 1}, eps));
++        }
++        return test_cases;
++    }
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -11928,7 +12023,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+         for (int v : {0, 1}) {
+             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
+-                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP) {
++                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP || op == GGML_GLU_OP_SITU) {
+                     continue;
+                 }
+ 
+@@ -15081,6 +15176,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ // Test cases for performance evaluation: should be representative of real-world use cases
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++    if (getenv("INK_PERF")) { // Inkling-2-Mini decode shapes, n tokens = 1 and 2
++      for (int n : {1, 2}) {
++        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0}) {
++            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304)); // gate_up
++            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152)); // down
++        }
++        for (int64_t m : {24, 384, 1024, 3072, 6552, 8600, 201024}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, 2304, {1, 1}, {1, 1}));
++        }
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, n, 2304, {1, 1}, {1, 1})); // router
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2304, n, 3072, {1, 1}, {1, 1})); // wo
++      }
++        return test_cases;
++    }
+ 
+     test_cases.emplace_back(new test_timestep_embedding());
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));

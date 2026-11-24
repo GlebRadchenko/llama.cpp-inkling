@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Radchenko <14540409+GlebRadchenko@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:15:12 +0100
+Subject: [PATCH 02/11] inkling2: clip via l2_norm (t*x/max(|x|,t)), 23 -> 8
+ dispatches per layer pass
+
+KLD vs CPU reference 0.00134 (stock Metal: 0.00158). pp1 24.5 -> 26.5 tok/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/inkling2.cpp | 30 ++++++++++++++----------------
+ 1 file changed, 14 insertions(+), 16 deletions(-)
+
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index a304e17..46d70a3 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -3,6 +3,9 @@
+ 
+ #include <algorithm>
+ #include <vector>
++#include <cstdlib>
++// profiling ablations (timing only, output is wrong when set)
++static bool ink_skip(const char * k) { const char * v = getenv(k); return v && *v == '1'; }
+ 
+ // max elements of the dense relative bias per attention call, and max chunks per layer
+ static constexpr int64_t n_kq_bias_max  = int64_t(1) << 29;
+@@ -172,22 +175,13 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const
+ 
+ // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
+ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il) {
++    static const bool skip = ink_skip("INK_SKIP_CLIP"); if (skip) return cur;
++    GGML_UNUSED(il);
+     if (scale) {
+         cur = ggml_mul(ctx0, cur, scale);
+     }
+-
+-    ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
+-    norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
+-
+-    // the threshold tensor only depends on the shape: fill it once per graph and layer device
+-    ggml_tensor *& limit = clip_limits[{ { model.dev_layer(il), norm->ne[1] }, threshold }];
+-    if (!limit) {
+-        limit = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, norm->ne[0], norm->ne[1], norm->ne[2], norm->ne[3]), threshold);
+-    }
+-
+-    ggml_tensor * factor = ggml_div(ctx0, limit, norm);
+-
+-    return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
++    // x*min(1, t/|x|) == t*x/max(|x|, t): one l2_norm instead of sqr, sum_rows, sqrt, div, clamp and mul
++    return ggml_scale(ctx0, ggml_l2_norm(ctx0, cur, threshold), threshold);
+ }
+ 
+ // attention over the depth: mix the earlier block outputs and cur with learned queries
+@@ -252,6 +246,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+         ggml_tensor * history,
+         llm_graph_input_rs * inp,
+         int64_t offset) {
++    static const bool skip = ink_skip("INK_SKIP_CONV"); if (skip) return cur;
+     const int64_t n_conv       = hparams.n_shortconv_l_cache;
+     const int64_t n_channels   = cur->ne[0];
+     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+@@ -300,6 +295,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ // cur_norm and message_norm are cur and message RMS-normalized
+ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
+         const loop_layer & loop, int ctrl) {
++    static const bool skip = ink_skip("INK_SKIP_CTRL"); if (skip) return cur;
+     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
+     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+ 
+@@ -412,7 +408,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
+     ggml_tensor * inputs[3] = {cur, cur, cur};
+-    if (layer.attn_res_query) {
++    static const bool skip_mix = ink_skip("INK_SKIP_MIX");
++    if (layer.attn_res_query && !skip_mix) {
+         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query, il);
+         if (is_swa) {
+             // one query, already contiguous
+@@ -644,14 +641,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+     cb(ffn_inp, "ffn_inp", il);
+ 
+     // MoE
+-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query, il), n_embd, n_tokens);
++    if (!skip_mix) cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query, il), n_embd, n_tokens);
+     if (messages) {
+         cur = control(cur, ggml_rms_norm(ctx0, cur, 1e-6f), message(messages, LOOP_CTRL_FFN), message(messages_norm, LOOP_CTRL_FFN),
+                 *loop, LOOP_CTRL_FFN);
+     }
+     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+ 
+-    cur = build_moe_ffn(cur,
++    static const bool skip_moe = ink_skip("INK_SKIP_MOE");
++    if (!skip_moe) cur = build_moe_ffn(cur,
+             layer.ffn_gate_inp,
+             nullptr,
+             nullptr,

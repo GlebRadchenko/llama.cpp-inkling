@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Radchenko <14540409+GlebRadchenko@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:15:13 +0100
+Subject: [PATCH 06/11] inkling2: clip factors of Q and K into the attention
+ scale, of R into the derived bias table
+
+3583 -> 3454 dispatches per decode token. KLD vs CPU 0.00110 (ub 512), 0.00114 (ub 2), 0.00117 (ub 1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/inkling2.cpp | 45 ++++++++++++++++++++++++-----------------
+ src/models/models.h     |  4 ++--
+ 2 files changed, 29 insertions(+), 20 deletions(-)
+
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 75990bd..d936d24 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -191,8 +191,12 @@ void llama_model_inkling2::post_load_data() {
+             conv_folded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1], 1, v.data());
+         }
+         if (ggml_tensor * w = layer.attn_rel_bias; w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w)) {
++            // the zero row of the out-of-extent positions, and R's clip factor (R stays unit-norm-clipped)
+             std::vector<float> v(w->ne[0]*(w->ne[1] + 1), 0.0f);
+             ggml_backend_tensor_get(w, v.data(), 0, ggml_nbytes(w));
++            for (float & x : v) {
++                x *= hparams.f_relative_clip;
++            }
+             rel_bias_padded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1] + 1, 1, v.data());
+         }
+     }
+@@ -203,14 +207,16 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const
+ }
+ 
+ // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
+-ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il) {
++ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il, bool unit) {
+     static const bool skip = ink_skip("INK_SKIP_CLIP"); if (skip) return cur;
+     GGML_UNUSED(il);
+     if (scale) {
+         cur = ggml_mul(ctx0, cur, scale);
+     }
+-    // x*min(1, t/|x|) == t*x/max(|x|, t): one l2_norm instead of sqr, sum_rows, sqrt, div, clamp and mul
+-    return ggml_scale(ctx0, ggml_l2_norm(ctx0, cur, threshold), threshold);
++    // x*min(1, t/|x|) == t*x/max(|x|, t): one l2_norm instead of sqr, sum_rows, sqrt, div, clamp and mul;
++    // unit leaves the factor t to the caller
++    cur = ggml_l2_norm(ctx0, cur, threshold);
++    return unit ? cur : ggml_scale(ctx0, cur, threshold);
+ }
+ 
+ // attention over the depth: mix the earlier block outputs and cur with learned queries
+@@ -538,10 +544,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         ggml_build_forward_expand(gf, Vcur);
+         ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+ 
+-        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip, il);
+-        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip, il);
++        // Q and K leave their clip factor t to the attention scale, R to its derived bias table when there is one
++        const auto & rel_tables = static_cast<const llama_model_inkling2 &>(model).rel_bias_padded;
++        const auto rel_it = rel_tables.find(layer.attn_rel_bias);
++        ggml_tensor * rel_table = rel_it != rel_tables.end() ? rel_it->second : nullptr; // [n_rel, n_extent + 1], times t
++        const float kq_scale = hparams.f_qk_clip*hparams.f_qk_clip/sqrtf(n_embd_head);
++
++        Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip, il, true);
++        Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip, il, true);
+         Vcur = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens), hparams.f_norm_rms_eps);
+-        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip, il);
++        Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip, il, rel_table != nullptr);
+ 
+         if (!is_swa) {
+             Qcur = ggml_mul(ctx0, Qcur, tau);
+@@ -566,14 +578,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+             const int64_t nr = n_rows_dense_reserve;
+             n_rows_dense_reserve = 0;
+             ggml_tensor * r_s = ggml_view_3d(ctx0, Rcur, Rcur->ne[0], n_head, nr, Rcur->nb[1], Rcur->nb[2], 0);
+-            ggml_tensor * t_s = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), r_s);
++            ggml_tensor * t_s = ggml_mul_mat(ctx0, rel_table ? rel_table : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), r_s);
+             t_s = ggml_cont(ctx0, ggml_permute(ctx0, t_s, 1, 0, 2, 3));
+             ggml_tensor * p_s = ggml_view_2d(ctx0, rel_pos, n_kv, nr, rel_pos->nb[1], 0);
+             ggml_tensor * b_s = ggml_get_rows(ctx0, t_s, p_s);
+             b_s = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, b_s, n_head, n_kv, nr, 1), 2, 0, 1, 3));
+             ggml_tensor * q_s = ggml_cont(ctx0, ggml_view_3d(ctx0, Qcur, n_embd_head, n_head, nr, Qcur->nb[1], Qcur->nb[2], 0));
+             ggml_build_forward_expand(gf, build_attn(inp, nullptr, nullptr, nullptr, q_s, nullptr, nullptr, b_s,
+-                    ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f), 1.0f/sqrtf(n_embd_head), il));
++                    ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f), kq_scale, il));
+         }
+         if (use_banded(il, is_swa)) {
+             const auto * cache = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+@@ -616,9 +628,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+                         mask->nb[1], mask->nb[2], mask->nb[3], 0));
+             }
+             // exp(s + b)/(exp(t) + sum(exp(s + b))): the dense mask b - t with a zero sink
+-            ggml_tensor * rel_b = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
++            ggml_tensor * rel_b = ggml_mul_mat(ctx0, rel_table ? ggml_view_2d(ctx0, rel_table, rel_table->ne[0], rel_table->ne[1] - 1, rel_table->nb[1], 0)
++                    : layer.attn_rel_bias, Rcur);
+             rel_b = ggml_reshape_4d(ctx0, rel_b, rel_b->ne[0], n_head, n_tokens, 1);
+-            cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, 1.0f/sqrtf(n_embd_head), rel_b->ne[0]);
++            cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, m, rel_b, kq_scale, rel_b->ne[0]);
+             ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, n_head, n_tokens, 1));
+             ggml_prec_set_acc(cur, GGML_PREC_F32);
+             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+@@ -630,19 +643,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         } else if (n_tokens == 1) {
+             // one query: gather its bias rows, then project straight into the [n_kv, 1, n_head] bias,
+             // and its per-query sink is a per-head sink of the attention
+-            const auto & padded = static_cast<const llama_model_inkling2 &>(model).rel_bias_padded;
+-            const auto it = padded.find(layer.attn_rel_bias);
+-            ggml_tensor * table = it != padded.end() ? it->second : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
++            ggml_tensor * table = rel_table ? rel_table : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+             ggml_tensor * kq_b = ggml_mul_mat(ctx0, ggml_get_rows(ctx0, table, rel_pos), Rcur);
+             kq_b = ggml_reshape_4d(ctx0, kq_b, n_kv, 1, n_head, 1);
+             cb(kq_b, "kq_b", il);
+             cur = build_attn(inp, nullptr, nullptr, nullptr, Qcur, Kcur, Vcur, kq_b, ggml_reshape_1d(ctx0, sinks, n_head),
+-                    1.0f/sqrtf(n_embd_head), il, 0);
++                    kq_scale, il, 0);
+         } else {
+             // project before gathering: only the gathered bias is n_kv x n_tokens x n_head
+-            const auto & padded = static_cast<const llama_model_inkling2 &>(model).rel_bias_padded;
+-            const auto it = padded.find(layer.attn_rel_bias);
+-            ggml_tensor * table = ggml_mul_mat(ctx0, it != padded.end() ? it->second : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
++            ggml_tensor * table = ggml_mul_mat(ctx0, rel_table ? rel_table : ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+ 
+             // per-query sink t: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s)))
+             table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+@@ -704,7 +713,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+                 // only the first chunk stores K and V
+                 ggml_tensor * out = build_attn(inp,
+                         nullptr, nullptr, nullptr,
+-                        q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, r0);
++                        q_c, r0 == 0 ? Kcur : nullptr, r0 == 0 ? Vcur : nullptr, kq_b, sinks, kq_scale, il, r0);
+                 if (all) {
+                     cur = out;
+                     break;
+diff --git a/src/models/models.h b/src/models/models.h
+index d0f8935..d52174d 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2593,14 +2593,14 @@ struct llama_model_inkling2 : public llama_model_base {
+     void post_load_data() override;
+     // derived at load: (cur + conv(x, w))*s as one conv, by source weight (the current input is the last tap)
+     std::unordered_map<const ggml_tensor *, ggml_tensor *> conv_folded;
+-    // derived at load: the relative-bias tables with the zero row of the out-of-extent positions, by source weight
++    // derived at load: the relative-bias tables times the R clip threshold, with the zero row of the out-of-extent positions, by source weight
+     std::unordered_map<const ggml_tensor *, ggml_tensor *> rel_bias_padded;
+ 
+     struct graph : public llm_graph_context {
+         graph(const llm_graph_params & params);
+         // il: the layer whose device runs the mix (the shared stacks are kept per device), -1 if unknown
+         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query, int il = -1);
+-        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il);
++        ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold, int il, bool unit = false);
+         ggml_tensor * convolve(
+                 ggml_tensor * cur,
+                 ggml_tensor * weight,

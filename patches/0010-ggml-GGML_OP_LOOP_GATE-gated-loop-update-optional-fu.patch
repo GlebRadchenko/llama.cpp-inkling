@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Radchenko <14540409+GlebRadchenko@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:15:14 +0100
+Subject: [PATCH 10/11] ggml: GGML_OP_LOOP_GATE (gated loop update, optional
+ fused RMS norm); Inkling2 loop controllers use the elementwise form
+
+tanh, 2 muls, sub and add in one fully parallel dispatch. The norm-fused form (INK_GATE_NORM=1) runs one threadgroup
+per row and measured 1.5% slower, so it is off. A/B tg64 36.0 -> 37.0 tok/s. KLD vs CPU 0.00129 (ub 512), 0.00117 (ub 1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h                       | 11 +++
+ ggml/src/ggml-cpu/ggml-cpu.c              |  5 ++
+ ggml/src/ggml-cpu/ops.cpp                 | 39 +++++++++++
+ ggml/src/ggml-cpu/ops.h                   |  1 +
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 13 ++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |  1 +
+ ggml/src/ggml-metal/ggml-metal-device.m   |  5 ++
+ ggml/src/ggml-metal/ggml-metal-impl.h     | 16 +++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 54 +++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.h      |  1 +
+ ggml/src/ggml-metal/kernels/norm.metal    | 83 +++++++++++++++++++++++
+ ggml/src/ggml.c                           | 38 ++++++++++-
+ src/models/inkling2.cpp                   | 47 ++++++++++---
+ src/models/models.h                       |  5 +-
+ 14 files changed, 308 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 4b90f23..3cf15be 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -452,6 +452,7 @@ extern "C" {
+ 
+         GGML_OP_SIGMOID_BACK,
+         GGML_OP_DEPTH_MIX,
++        GGML_OP_LOOP_GATE,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -1071,6 +1072,16 @@ extern "C" {
+             float                 scale,
+             float                 eps);
+ 
++    // gated loop update: per row y = x - tanh(f)*x + tanh(g)*m, out = rms_norm(y, eps)*w, or y when w is NULL
++    // fg [2E, n, B] (f the first E values of a row, g the last E), x [E, n, 1 or B], m [E, n, B], w [E, 1 or B] -> [E, n, B]
++    GGML_API struct ggml_tensor * ggml_loop_gate(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * fg,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * m,
++            struct ggml_tensor  * w,
++            float                 eps);
++
+     GGML_API struct ggml_tensor * ggml_sigmoid_back(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index cf05d7e..9bd7c7e 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1910,6 +1910,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_depth_mix(params, tensor);
+             } break;
++        case GGML_OP_LOOP_GATE:
++            {
++                ggml_compute_forward_loop_gate(params, tensor);
++            } break;
+         case GGML_OP_NORM:
+             {
+                 ggml_compute_forward_norm(params, tensor);
+@@ -2422,6 +2426,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_SILU_BACK:
+         case GGML_OP_SIGMOID_BACK:
+         case GGML_OP_DEPTH_MIX:
++        case GGML_OP_LOOP_GATE:
+         case GGML_OP_MUL:
+         case GGML_OP_DIV:
+         case GGML_OP_NORM:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 65ea06d..6ed802a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2973,6 +2973,45 @@ void ggml_compute_forward_depth_mix(
+     }
+ }
+ 
++// ggml_compute_forward_loop_gate
++
++void ggml_compute_forward_loop_gate(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * fg = dst->src[0];
++    const ggml_tensor * x  = dst->src[1];
++    const ggml_tensor * m  = dst->src[2];
++    const ggml_tensor * w  = dst->src[3];
++
++    const int64_t E = dst->ne[0];
++    const int64_t n = dst->ne[1];
++    const int64_t B = dst->ne[2];
++
++    float eps;
++    memcpy(&eps, dst->op_params, sizeof(float));
++
++    std::vector<float> y(E);
++    for (int64_t r = params->ith; r < n*B; r += params->nth) {
++        const int64_t t = r % n;
++        const int64_t b = r / n;
++        const float * f  = (const float *) ((const char *) fg->data + t*fg->nb[1] + b*fg->nb[2]);
++        const float * g  = f + E;
++        const float * xr = (const float *) ((const char *) x->data + t*x->nb[1] + (x->ne[2] == 1 ? 0 : b)*x->nb[2]);
++        const float * mr = (const float *) ((const char *) m->data + t*m->nb[1] + b*m->nb[2]);
++        const float * wr = w ? (const float *) w->data + (w->ne[1] == 1 ? 0 : b)*E : nullptr;
++        float ss = 0.0f;
++        for (int64_t e = 0; e < E; ++e) {
++            y[e] = (xr[e] - tanhf(f[e])*xr[e]) + tanhf(g[e])*mr[e];
++            ss += y[e]*y[e];
++        }
++        const float scale = 1.0f/sqrtf(ss/E + eps);
++        float * out = (float *) ((char *) dst->data + t*dst->nb[1] + b*dst->nb[2]);
++        for (int64_t e = 0; e < E; ++e) {
++            out[e] = wr ? (y[e]*scale)*wr[e] : y[e];
++        }
++    }
++}
++
+ // ggml_compute_forward_sigmoid_back
+ 
+ static void ggml_compute_forward_sigmoid_back_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 9499cee..ae99519 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -43,6 +43,7 @@ void ggml_compute_forward_concat(const struct ggml_compute_params * params, stru
+ void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_sigmoid_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_depth_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_loop_gate(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index d4e1405..3fe7c31 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -2295,6 +2295,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_gate(ggml_metal_library_t lib, bool norm) {
++    const char * name = norm ? "kernel_loop_gate_f32" : "kernel_loop_gate_nonorm_f32";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    res.smem = 32*sizeof(float);
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
+     assert(op->op == GGML_OP_GROUP_NORM);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 60d7812..1e98660 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -161,6 +161,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_depth_mix         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state        (ggml_metal_library_t lib, int32_t nc);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_gate         (ggml_metal_library_t lib, bool norm);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index d4fb6cb..72116a6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1694,6 +1694,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+             return has_simdgroup_reduction && ggml_is_contiguous(op->src[0]);
+         case GGML_OP_TRI:
+             return ggml_is_contiguous_rows(op->src[0]);
++        case GGML_OP_LOOP_GATE:
++            return has_simdgroup_reduction && op->ne[0] % 4 == 0 &&
++                op->src[0]->nb[1] % 16 == 0 && op->src[0]->nb[2] % 16 == 0 &&
++                op->src[1]->nb[1] % 16 == 0 && op->src[1]->nb[2] % 16 == 0 &&
++                op->src[2]->nb[1] % 16 == 0 && op->src[2]->nb[2] % 16 == 0;
+         case GGML_OP_DEPTH_MIX:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 4 == 0 &&
+                 ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && op->ne[1] <= 4 &&
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index be9d65e..03b39ae 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -707,6 +707,22 @@ typedef struct {
+     uint64_t nbx2;  // x, per sequence
+ } ggml_metal_kargs_conv_state;
+ 
++typedef struct {
++    int32_t  E;
++    int32_t  n;
++    int32_t  bx;    // 1: x broadcasts over the batch
++    int32_t  bw;    // 1: w broadcasts over the batch
++    uint64_t nbf1;  // fg, per token
++    uint64_t nbf2;  // fg, per batch
++    uint64_t nbx1;
++    uint64_t nbx2;
++    uint64_t nbm1;
++    uint64_t nbm2;
++    uint64_t nb1;   // dst, per token
++    uint64_t nb2;   // dst, per batch
++    float    eps;
++} ggml_metal_kargs_loop_gate;
++
+ typedef struct {
+     int64_t  ne00;
+     int64_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 3f46924..1ad96b4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -404,6 +404,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_depth_mix(ctx, idx);
+             } break;
++        case GGML_OP_LOOP_GATE:
++            {
++                n_fuse = ggml_metal_op_loop_gate(ctx, idx);
++            } break;
+         case GGML_OP_L2_NORM:
+             {
+                 n_fuse = ggml_metal_op_l2_norm(ctx, idx);
+@@ -4706,6 +4710,56 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_loop_gate(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    const ggml_tensor * fg = op->src[0];
++    const ggml_tensor * x  = op->src[1];
++    const ggml_tensor * m  = op->src[2];
++    const ggml_tensor * w  = op->src[3];
++
++    float eps;
++    memcpy(&eps, op->op_params, sizeof(float));
++
++    ggml_metal_kargs_loop_gate args = {
++        /*.E    =*/ (int32_t) op->ne[0],
++        /*.n    =*/ (int32_t) op->ne[1],
++        /*.bx   =*/ x->ne[2] == 1 && op->ne[2] > 1,
++        /*.bw   =*/ !w || w->ne[1] == 1,
++        /*.nbf1 =*/ fg->nb[1],
++        /*.nbf2 =*/ fg->nb[2],
++        /*.nbx1 =*/ x->nb[1],
++        /*.nbx2 =*/ x->nb[2],
++        /*.nbm1 =*/ m->nb[1],
++        /*.nbm2 =*/ m->nb[2],
++        /*.nb1  =*/ op->nb[1],
++        /*.nb2  =*/ op->nb[2],
++        /*.eps  =*/ eps,
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_loop_gate(ctx->lib, w != nullptr);
++
++    ggml_metal_encoder_t enc = ctx->enc;
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(fg), 1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),  2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m),  3);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w ? w : fg), 4);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 5);
++    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
++
++    if (w) {
++        // one threadgroup per row
++        ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], op->ne[2], 1, 256, 1, 1);
++    } else {
++        // elementwise: 64 float4 per threadgroup, over every core
++        ggml_metal_encoder_dispatch_threadgroups(enc, (op->ne[0]/4 + 63)/64, op->ne[1], op->ne[2], 64, 1, 1);
++    }
++
++    return 1;
++}
++
+ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index e426e77..86a6dc9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -84,6 +84,7 @@ int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_silu_back         (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_depth_mix         (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_loop_gate         (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/kernels/norm.metal b/ggml/src/ggml-metal/kernels/norm.metal
+index 2e55723..dbf2bb1 100644
+--- a/ggml/src/ggml-metal/kernels/norm.metal
++++ b/ggml/src/ggml-metal/kernels/norm.metal
+@@ -480,3 +480,86 @@ kernel void kernel_depth_mix_f32(
+         }
+     }
+ }
++
++// gated loop update, normalized (GGML_OP_LOOP_GATE): one threadgroup per row, y recomputed for the store
++kernel void kernel_loop_gate_f32(
++        constant ggml_metal_kargs_loop_gate & args,
++        device const char * fg,
++        device const char * x,
++        device const char * m,
++        device const char * w,
++        device       char * dst,
++        threadgroup float * shmem [[threadgroup(0)]],
++        uint2  tgpig[[threadgroup_position_in_grid]],
++        ushort tpitg[[thread_index_in_threadgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort2  ntg2[[threads_per_threadgroup]]) {
++    const ushort ntg = ntg2.x;
++    const int t  = tgpig.x;
++    const int b  = tgpig.y;
++    const int n4 = args.E/4;
++
++    device const float4 * f  = (device const float4 *) (fg + t*args.nbf1 + b*args.nbf2);
++    device const float4 * g  = f + n4;
++    device const float4 * xr = (device const float4 *) (x  + t*args.nbx1 + (args.bx ? 0 : b)*args.nbx2);
++    device const float4 * mr = (device const float4 *) (m  + t*args.nbm1 + b*args.nbm2);
++    device const float4 * wr = (device const float4 *) (w) + (args.bw ? 0 : b)*n4;
++    device       float4 * y  = (device       float4 *) (dst + t*args.nb1 + b*args.nb2);
++
++    if (sgitg == 0) {
++        shmem[tiisg] = 0.0f;
++    }
++
++    float sumf = 0.0f;
++    for (int i = tpitg; i < n4; i += ntg) {
++        const float4 xv = xr[i];
++        const float4 v  = (xv - precise::tanh(f[i])*xv) + precise::tanh(g[i])*mr[i];
++        sumf += dot(v, v);
++    }
++    sumf = simd_sum(sumf);
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    if (tiisg == 0) {
++        shmem[sgitg] = sumf;
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    sumf = simd_sum(shmem[tiisg]);
++
++    const float scale = 1.0f/sqrt(sumf/args.E + args.eps);
++
++    for (int i = tpitg; i < n4; i += ntg) {
++        const float4 xv = xr[i];
++        const float4 v  = (xv - precise::tanh(f[i])*xv) + precise::tanh(g[i])*mr[i];
++        y[i] = (v*scale)*wr[i];
++    }
++}
++
++// GGML_OP_LOOP_GATE without the norm: one float4 per thread
++kernel void kernel_loop_gate_nonorm_f32(
++        constant ggml_metal_kargs_loop_gate & args,
++        device const char * fg,
++        device const char * x,
++        device const char * m,
++        device const char * w,
++        device       char * dst,
++        threadgroup float * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    const int i  = tgpig.x*ntg.x + tpitg.x;
++    const int t  = tgpig.y;
++    const int b  = tgpig.z;
++    const int n4 = args.E/4;
++    if (i >= n4) {
++        return;
++    }
++
++    device const float4 * f  = (device const float4 *) (fg + t*args.nbf1 + b*args.nbf2);
++    device const float4 * xr = (device const float4 *) (x  + t*args.nbx1 + (args.bx ? 0 : b)*args.nbx2);
++    device const float4 * mr = (device const float4 *) (m  + t*args.nbm1 + b*args.nbm2);
++    device       float4 * y  = (device       float4 *) (dst + t*args.nb1 + b*args.nb2);
++
++    const float4 xv = xr[i];
++    y[i] = (xv - precise::tanh(f[i])*xv) + precise::tanh(f[i + n4])*mr[i];
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 1d931eb..ae21043 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1152,9 +1152,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+ 
+     "SIGMOID_BACK",
+     "DEPTH_MIX",
++    "LOOP_GATE",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1271,9 +1272,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+ 
+     "sigmoid_back(x)",
+     "depth_mix(x)",
++    "loop_gate(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -2944,6 +2946,38 @@ struct ggml_tensor * ggml_depth_mix(
+     return result;
+ }
+ 
++// ggml_loop_gate
++
++struct ggml_tensor * ggml_loop_gate(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * fg,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * m,
++        struct ggml_tensor  * w,
++        float                 eps) {
++    const int64_t E = m->ne[0];
++    const int64_t n = m->ne[1];
++    const int64_t B = m->ne[2];
++
++    GGML_ASSERT(fg->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && (!w || w->type == GGML_TYPE_F32));
++    GGML_ASSERT(fg->ne[0] == 2*E && fg->ne[1] == n && fg->ne[2] == B && fg->ne[3] == 1 && fg->nb[0] == sizeof(float));
++    GGML_ASSERT(x->ne[0] == E && x->ne[1] == n && (x->ne[2] == 1 || x->ne[2] == B) && x->ne[3] == 1 && x->nb[0] == sizeof(float));
++    GGML_ASSERT(m->ne[3] == 1 && m->nb[0] == sizeof(float));
++    GGML_ASSERT(!w || (w->ne[0] == E && (w->ne[1] == 1 || w->ne[1] == B) && ggml_is_contiguous(w)));
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, n, B);
++
++    ggml_set_op_params(result, &eps, sizeof(eps));
++
++    result->op     = GGML_OP_LOOP_GATE;
++    result->src[0] = fg;
++    result->src[1] = x;
++    result->src[2] = m;
++    result->src[3] = w;
++
++    return result;
++}
++
+ // ggml_sigmoid_back
+ 
+ struct ggml_tensor * ggml_sigmoid_back(
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 6662ccf..5230640 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -190,6 +190,20 @@ void llama_model_inkling2::post_load_data() {
+             }
+             conv_folded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1], 1, v.data());
+         }
++        if (!swa && layer.attn_q_inp_norm && layer.attn_k_inp_norm && layer.attn_v_inp_norm) {
++            const ggml_tensor * norms[3] = { layer.attn_q_inp_norm, layer.attn_k_inp_norm, layer.attn_v_inp_norm };
++            bool ok = true;
++            for (const ggml_tensor * t : norms) {
++                ok = ok && t->type == GGML_TYPE_F32 && ggml_nelements(t) == hparams.n_embd;
++            }
++            if (ok) {
++                std::vector<float> v(3*hparams.n_embd);
++                for (int j = 0; j < 3; ++j) {
++                    ggml_backend_tensor_get(norms[j], v.data() + j*hparams.n_embd, 0, ggml_nbytes(norms[j]));
++                }
++                qkv_norm_stacked[layer.attn_q_inp_norm] = new_derived_weight(layer.attn_q_inp_norm, GGML_TYPE_F32, hparams.n_embd, 3, 1, v.data());
++            }
++        }
+         if (ggml_tensor * w = layer.attn_rel_bias; w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w)) {
+             // the zero row of the out-of-extent positions, and R's clip factor (R stays unit-norm-clipped)
+             std::vector<float> v(w->ne[0]*(w->ne[1] + 1), 0.0f);
+@@ -318,11 +332,21 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
+ // cur_norm and message_norm are cur and message RMS-normalized
+ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
+-        const loop_layer & loop, int ctrl) {
++        const loop_layer & loop, int ctrl, ggml_tensor * norm_w, bool * normed) {
+     static const bool skip = ink_skip("INK_SKIP_CTRL"); if (skip) return cur;
+     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
+     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+ 
++    if (ggml_tensor * w = loop.ctrl_fg_all) {
++        // forget and gain in one matmul, the update in one op (its norm too when wanted)
++        static const bool fuse_norm = ink_skip("INK_GATE_NORM");
++        ggml_tensor * fg = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, w->ne[0], w->ne[1], w->nb[1], ctrl*w->nb[2]), gate);
++        if (normed) {
++            *normed = fuse_norm && norm_w;
++        }
++        return ggml_reshape_2d(ctx0, ggml_loop_gate(ctx0, fg, cur, message, fuse_norm ? norm_w : nullptr, hparams.f_norm_rms_eps), n_embd, fg->ne[1]);
++    }
++
+     if (ggml_tensor * w = loop.ctrl_fg_all) {
+         // forget and gain in one matmul: rows [0, n_embd) forget, [n_embd, 2*n_embd) gain
+         ggml_tensor * fg = ggml_tanh(ctx0, ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, w->ne[0], w->ne[1], w->nb[1], ctrl*w->nb[2]), gate));
+@@ -475,11 +499,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         ggml_tensor * wf = loop->ctrl_fg_all;
+         ggml_tensor * gate = ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wd, wd->ne[0], wd->ne[1], 3, wd->nb[1], wd->nb[2], 0),
+                 ggml_concat(ctx0, xn, by_ctrl(messages_norm), 0));
+-        ggml_tensor * fg = ggml_tanh(ctx0, ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wf, wf->ne[0], wf->ne[1], 3, wf->nb[1], wf->nb[2], 0), gate));
+-        ggml_tensor * forget = ggml_view_3d(ctx0, fg, n_embd, n_tokens, 3, fg->nb[1], fg->nb[2], 0);
+-        ggml_tensor * gain   = ggml_view_3d(ctx0, fg, n_embd, n_tokens, 3, fg->nb[1], fg->nb[2], n_embd*ggml_element_size(fg));
+-        ggml_tensor * out = ggml_add(ctx0, ggml_sub(ctx0, ggml_mul(ctx0, gain, by_ctrl(messages)), ggml_mul(ctx0, forget, x)), x);
+-        if (is_swa) {
++        ggml_tensor * fg = ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wf, wf->ne[0], wf->ne[1], 3, wf->nb[1], wf->nb[2], 0), gate);
++        // the update and the input norms in one op: one weight for a SWA layer, the q, k and v norms stacked otherwise
++        const auto & stacked = static_cast<const llama_model_inkling2 &>(model).qkv_norm_stacked;
++        const auto it_norm = is_swa ? stacked.end() : stacked.find(layer.attn_q_inp_norm);
++        ggml_tensor * norm_w = is_swa ? layer.attn_norm : (it_norm != stacked.end() ? it_norm->second : nullptr);
++        static const bool fuse_norm = ink_skip("INK_GATE_NORM");
++        ggml_tensor * out = ggml_loop_gate(ctx0, fg, x, by_ctrl(messages), fuse_norm ? norm_w : nullptr, hparams.f_norm_rms_eps);
++        inputs_normed = fuse_norm && norm_w;
++        if (!inputs_normed && is_swa) {
+             // one norm weight for the three inputs
+             out = build_norm(out, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+             inputs_normed = true;
+@@ -726,11 +754,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+     // MoE
+     if (!skip_mix) cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query, il), n_embd, n_tokens);
++    bool ffn_normed = false;
+     if (messages) {
+         cur = control(cur, ggml_rms_norm(ctx0, cur, 1e-6f), message(messages, LOOP_CTRL_FFN), message(messages_norm, LOOP_CTRL_FFN),
+-                *loop, LOOP_CTRL_FFN);
++                *loop, LOOP_CTRL_FFN, layer.ffn_norm, &ffn_normed);
++    }
++    if (!ffn_normed) {
++        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+     }
+-    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+ 
+     static const bool skip_moe = ink_skip("INK_SKIP_MOE");
+     if (!skip_moe) cur = build_moe_ffn(cur,
+diff --git a/src/models/models.h b/src/models/models.h
+index d52174d..ca6bc37 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2595,6 +2595,8 @@ struct llama_model_inkling2 : public llama_model_base {
+     std::unordered_map<const ggml_tensor *, ggml_tensor *> conv_folded;
+     // derived at load: the relative-bias tables times the R clip threshold, with the zero row of the out-of-extent positions, by source weight
+     std::unordered_map<const ggml_tensor *, ggml_tensor *> rel_bias_padded;
++    // derived at load: the q, k and v input norms of a full-attention layer stacked [n_embd, 3], by its q input norm
++    std::unordered_map<const ggml_tensor *, ggml_tensor *> qkv_norm_stacked;
+ 
+     struct graph : public llm_graph_context {
+         graph(const llm_graph_params & params);
+@@ -2609,8 +2611,9 @@ struct llama_model_inkling2 : public llama_model_base {
+                 ggml_tensor * history,
+                 llm_graph_input_rs * inp,
+                 int64_t offset);
++        // norm_w: also RMS-normalize the result and scale it by norm_w (one fused op), when the model has the derived weights
+         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
+-                const loop_layer & loop, int ctrl);
++                const loop_layer & loop, int ctrl, ggml_tensor * norm_w = nullptr, bool * normed = nullptr);
+ 
+     protected:
+         // the helpers alone, a derived graph builds its own body
