@@ -2358,9 +2358,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    post_load_data();
+
     llama_model_shared_host_views(layers, pimpl->ctx_shared_views, hdmd.rot, prec_policy, w_scales);
 
     return true;
+}
+
+ggml_tensor * llama_model::new_derived_weight(const ggml_tensor * like, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, const void * data) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(like->buffer);
+    // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
+    if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            buft = ggml_backend_dev_buffer_type(dev);
+        }
+    }
+    ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), type, ne0, ne1, ne2);
+    ggml_format_name(t, "%s.derived", like->name);
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        throw std::runtime_error(format("unable to allocate a derived weight for %s", like->name));
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+    return t;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

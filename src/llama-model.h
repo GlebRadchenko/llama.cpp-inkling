@@ -1122,6 +1122,12 @@ struct llama_model {
     // optional, runs after the scale pass
     virtual void post_arch_tensors(llama_model_loader &) {}
 
+    // optional, runs once the weights are loaded: build weights derived from them with new_derived_weight()
+    virtual void post_load_data() {}
+
+    // a weight computed at load time, in the buffer type of `like` and owned by the model; data is ne0*ne1*ne2 values of type
+    ggml_tensor * new_derived_weight(const ggml_tensor * like, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, const void * data);
+
 protected:
     llama_model_params params;
 

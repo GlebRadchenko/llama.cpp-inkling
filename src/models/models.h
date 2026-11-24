@@ -2585,7 +2585,14 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * ctrl_down[LOOP_CTRL_COUNT]   = {};
         ggml_tensor * ctrl_gain[LOOP_CTRL_COUNT]   = {};
         ggml_tensor * ctrl_forget[LOOP_CTRL_COUNT] = {};
+        // derived at load: the downs stacked [2*n_embd, rank, LOOP_CTRL_COUNT], and forget over gain [rank, 2*n_embd, LOOP_CTRL_COUNT]
+        ggml_tensor * ctrl_down_all = nullptr;
+        ggml_tensor * ctrl_fg_all   = nullptr;
     };
+
+    void post_load_data() override;
+    // derived at load: (cur + conv(x, w))*s as one conv, by source weight (the current input is the last tap)
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> conv_folded;
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
@@ -2653,6 +2660,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
     void post_arch_tensors(llama_model_loader & ml) override;
+    void post_load_data() override;
 
     int n_layer_phys() const override { return n_phys; }
     int layer_phys(int il) const;

@@ -119,6 +119,34 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
+void llama_model_inkling2_loop::post_load_data() {
+    llama_model_inkling2::post_load_data();
+
+    const int64_t n_in  = 2*hparams.n_embd;
+    const int64_t rank  = gate_rank;
+    const int64_t n_mat = n_in*rank; // elements of a down, and of a forget plus a gain
+    for (auto & l : loop_layers) {
+        bool ok = true;
+        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
+            for (ggml_tensor * t : { l.ctrl_down[c], l.ctrl_gain[c], l.ctrl_forget[c] }) {
+                ok = ok && t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        std::vector<float> down(LOOP_CTRL_COUNT*n_mat);
+        std::vector<float> fg(LOOP_CTRL_COUNT*n_mat);
+        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
+            ggml_backend_tensor_get(l.ctrl_down[c],   down.data() + c*n_mat,            0, ggml_nbytes(l.ctrl_down[c]));
+            ggml_backend_tensor_get(l.ctrl_forget[c], fg.data()   + c*n_mat,            0, ggml_nbytes(l.ctrl_forget[c]));
+            ggml_backend_tensor_get(l.ctrl_gain[c],   fg.data()   + c*n_mat + n_mat/2,  0, ggml_nbytes(l.ctrl_gain[c]));
+        }
+        l.ctrl_down_all = new_derived_weight(l.ctrl_down[0],   GGML_TYPE_F32, n_in, rank, LOOP_CTRL_COUNT, down.data());
+        l.ctrl_fg_all   = new_derived_weight(l.ctrl_forget[0], GGML_TYPE_F32, rank, n_in, LOOP_CTRL_COUNT, fg.data());
+    }
+}
+
 void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
     // share the physical weights, each cache slot keeps its own KV and conv state
     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
