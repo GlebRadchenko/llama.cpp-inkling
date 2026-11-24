@@ -2295,6 +2295,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_loop_gate(ggml_metal_library_t lib, bool norm) {
+    const char * name = norm ? "kernel_loop_gate_f32" : "kernel_loop_gate_nonorm_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.smem = 32*sizeof(float);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_GROUP_NORM);
 

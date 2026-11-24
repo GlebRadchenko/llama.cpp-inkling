@@ -452,6 +452,7 @@ extern "C" {
 
         GGML_OP_SIGMOID_BACK,
         GGML_OP_DEPTH_MIX,
+        GGML_OP_LOOP_GATE,
 
         GGML_OP_COUNT,
     };
@@ -1069,6 +1070,16 @@ extern "C" {
             struct ggml_tensor  * query,
             struct ggml_tensor  * states,
             float                 scale,
+            float                 eps);
+
+    // gated loop update: per row y = x - tanh(f)*x + tanh(g)*m, out = rms_norm(y, eps)*w, or y when w is NULL
+    // fg [2E, n, B] (f the first E values of a row, g the last E), x [E, n, 1 or B], m [E, n, B], w [E, 1 or B] -> [E, n, B]
+    GGML_API struct ggml_tensor * ggml_loop_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * fg,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * m,
+            struct ggml_tensor  * w,
             float                 eps);
 
     GGML_API struct ggml_tensor * ggml_sigmoid_back(

@@ -480,3 +480,86 @@ kernel void kernel_depth_mix_f32(
         }
     }
 }
+
+// gated loop update, normalized (GGML_OP_LOOP_GATE): one threadgroup per row, y recomputed for the store
+kernel void kernel_loop_gate_f32(
+        constant ggml_metal_kargs_loop_gate & args,
+        device const char * fg,
+        device const char * x,
+        device const char * m,
+        device const char * w,
+        device       char * dst,
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint2  tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort2  ntg2[[threads_per_threadgroup]]) {
+    const ushort ntg = ntg2.x;
+    const int t  = tgpig.x;
+    const int b  = tgpig.y;
+    const int n4 = args.E/4;
+
+    device const float4 * f  = (device const float4 *) (fg + t*args.nbf1 + b*args.nbf2);
+    device const float4 * g  = f + n4;
+    device const float4 * xr = (device const float4 *) (x  + t*args.nbx1 + (args.bx ? 0 : b)*args.nbx2);
+    device const float4 * mr = (device const float4 *) (m  + t*args.nbm1 + b*args.nbm2);
+    device const float4 * wr = (device const float4 *) (w) + (args.bw ? 0 : b)*n4;
+    device       float4 * y  = (device       float4 *) (dst + t*args.nb1 + b*args.nb2);
+
+    if (sgitg == 0) {
+        shmem[tiisg] = 0.0f;
+    }
+
+    float sumf = 0.0f;
+    for (int i = tpitg; i < n4; i += ntg) {
+        const float4 xv = xr[i];
+        const float4 v  = (xv - precise::tanh(f[i])*xv) + precise::tanh(g[i])*mr[i];
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        shmem[sgitg] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = simd_sum(shmem[tiisg]);
+
+    const float scale = 1.0f/sqrt(sumf/args.E + args.eps);
+
+    for (int i = tpitg; i < n4; i += ntg) {
+        const float4 xv = xr[i];
+        const float4 v  = (xv - precise::tanh(f[i])*xv) + precise::tanh(g[i])*mr[i];
+        y[i] = (v*scale)*wr[i];
+    }
+}
+
+// GGML_OP_LOOP_GATE without the norm: one float4 per thread
+kernel void kernel_loop_gate_nonorm_f32(
+        constant ggml_metal_kargs_loop_gate & args,
+        device const char * fg,
+        device const char * x,
+        device const char * m,
+        device const char * w,
+        device       char * dst,
+        threadgroup float * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i  = tgpig.x*ntg.x + tpitg.x;
+    const int t  = tgpig.y;
+    const int b  = tgpig.z;
+    const int n4 = args.E/4;
+    if (i >= n4) {
+        return;
+    }
+
+    device const float4 * f  = (device const float4 *) (fg + t*args.nbf1 + b*args.nbf2);
+    device const float4 * xr = (device const float4 *) (x  + t*args.nbx1 + (args.bx ? 0 : b)*args.nbx2);
+    device const float4 * mr = (device const float4 *) (m  + t*args.nbm1 + b*args.nbm2);
+    device       float4 * y  = (device       float4 *) (dst + t*args.nb1 + b*args.nb2);
+
+    const float4 xv = xr[i];
+    y[i] = (xv - precise::tanh(f[i])*xv) + precise::tanh(f[i + n4])*mr[i];
+}

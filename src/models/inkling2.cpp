@@ -190,6 +190,20 @@ void llama_model_inkling2::post_load_data() {
             }
             conv_folded[w] = new_derived_weight(w, GGML_TYPE_F32, w->ne[0], w->ne[1], 1, v.data());
         }
+        if (!swa && layer.attn_q_inp_norm && layer.attn_k_inp_norm && layer.attn_v_inp_norm) {
+            const ggml_tensor * norms[3] = { layer.attn_q_inp_norm, layer.attn_k_inp_norm, layer.attn_v_inp_norm };
+            bool ok = true;
+            for (const ggml_tensor * t : norms) {
+                ok = ok && t->type == GGML_TYPE_F32 && ggml_nelements(t) == hparams.n_embd;
+            }
+            if (ok) {
+                std::vector<float> v(3*hparams.n_embd);
+                for (int j = 0; j < 3; ++j) {
+                    ggml_backend_tensor_get(norms[j], v.data() + j*hparams.n_embd, 0, ggml_nbytes(norms[j]));
+                }
+                qkv_norm_stacked[layer.attn_q_inp_norm] = new_derived_weight(layer.attn_q_inp_norm, GGML_TYPE_F32, hparams.n_embd, 3, 1, v.data());
+            }
+        }
         if (ggml_tensor * w = layer.attn_rel_bias; w && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w)) {
             // the zero row of the out-of-extent positions, and R's clip factor (R stays unit-norm-clipped)
             std::vector<float> v(w->ne[0]*(w->ne[1] + 1), 0.0f);
@@ -318,10 +332,20 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 // cur_norm and message_norm are cur and message RMS-normalized
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
-        const loop_layer & loop, int ctrl) {
+        const loop_layer & loop, int ctrl, ggml_tensor * norm_w, bool * normed) {
     static const bool skip = ink_skip("INK_SKIP_CTRL"); if (skip) return cur;
     ggml_tensor * gate = ggml_concat(ctx0, cur_norm, message_norm, 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+
+    if (ggml_tensor * w = loop.ctrl_fg_all) {
+        // forget and gain in one matmul, the update in one op (its norm too when wanted)
+        static const bool fuse_norm = ink_skip("INK_GATE_NORM");
+        ggml_tensor * fg = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, w->ne[0], w->ne[1], w->nb[1], ctrl*w->nb[2]), gate);
+        if (normed) {
+            *normed = fuse_norm && norm_w;
+        }
+        return ggml_reshape_2d(ctx0, ggml_loop_gate(ctx0, fg, cur, message, fuse_norm ? norm_w : nullptr, hparams.f_norm_rms_eps), n_embd, fg->ne[1]);
+    }
 
     if (ggml_tensor * w = loop.ctrl_fg_all) {
         // forget and gain in one matmul: rows [0, n_embd) forget, [n_embd, 2*n_embd) gain
@@ -475,11 +499,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * wf = loop->ctrl_fg_all;
         ggml_tensor * gate = ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wd, wd->ne[0], wd->ne[1], 3, wd->nb[1], wd->nb[2], 0),
                 ggml_concat(ctx0, xn, by_ctrl(messages_norm), 0));
-        ggml_tensor * fg = ggml_tanh(ctx0, ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wf, wf->ne[0], wf->ne[1], 3, wf->nb[1], wf->nb[2], 0), gate));
-        ggml_tensor * forget = ggml_view_3d(ctx0, fg, n_embd, n_tokens, 3, fg->nb[1], fg->nb[2], 0);
-        ggml_tensor * gain   = ggml_view_3d(ctx0, fg, n_embd, n_tokens, 3, fg->nb[1], fg->nb[2], n_embd*ggml_element_size(fg));
-        ggml_tensor * out = ggml_add(ctx0, ggml_sub(ctx0, ggml_mul(ctx0, gain, by_ctrl(messages)), ggml_mul(ctx0, forget, x)), x);
-        if (is_swa) {
+        ggml_tensor * fg = ggml_mul_mat(ctx0, ggml_view_3d(ctx0, wf, wf->ne[0], wf->ne[1], 3, wf->nb[1], wf->nb[2], 0), gate);
+        // the update and the input norms in one op: one weight for a SWA layer, the q, k and v norms stacked otherwise
+        const auto & stacked = static_cast<const llama_model_inkling2 &>(model).qkv_norm_stacked;
+        const auto it_norm = is_swa ? stacked.end() : stacked.find(layer.attn_q_inp_norm);
+        ggml_tensor * norm_w = is_swa ? layer.attn_norm : (it_norm != stacked.end() ? it_norm->second : nullptr);
+        static const bool fuse_norm = ink_skip("INK_GATE_NORM");
+        ggml_tensor * out = ggml_loop_gate(ctx0, fg, x, by_ctrl(messages), fuse_norm ? norm_w : nullptr, hparams.f_norm_rms_eps);
+        inputs_normed = fuse_norm && norm_w;
+        if (!inputs_normed && is_swa) {
             // one norm weight for the three inputs
             out = build_norm(out, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
             inputs_normed = true;
@@ -726,11 +754,14 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // MoE
     if (!skip_mix) cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query, il), n_embd, n_tokens);
+    bool ffn_normed = false;
     if (messages) {
         cur = control(cur, ggml_rms_norm(ctx0, cur, 1e-6f), message(messages, LOOP_CTRL_FFN), message(messages_norm, LOOP_CTRL_FFN),
-                *loop, LOOP_CTRL_FFN);
+                *loop, LOOP_CTRL_FFN, layer.ffn_norm, &ffn_normed);
     }
-    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    if (!ffn_normed) {
+        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+    }
 
     static const bool skip_moe = ink_skip("INK_SKIP_MOE");
     if (!skip_moe) cur = build_moe_ffn(cur,

@@ -404,6 +404,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_depth_mix(ctx, idx);
             } break;
+        case GGML_OP_LOOP_GATE:
+            {
+                n_fuse = ggml_metal_op_loop_gate(ctx, idx);
+            } break;
         case GGML_OP_L2_NORM:
             {
                 n_fuse = ggml_metal_op_l2_norm(ctx, idx);
@@ -4702,6 +4706,56 @@ int ggml_metal_op_depth_mix(ggml_metal_op_t ctx, int idx) {
 
     // one threadgroup of 8 simdgroups per token
     ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[2], 1, 1, 256, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_loop_gate(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    const ggml_tensor * fg = op->src[0];
+    const ggml_tensor * x  = op->src[1];
+    const ggml_tensor * m  = op->src[2];
+    const ggml_tensor * w  = op->src[3];
+
+    float eps;
+    memcpy(&eps, op->op_params, sizeof(float));
+
+    ggml_metal_kargs_loop_gate args = {
+        /*.E    =*/ (int32_t) op->ne[0],
+        /*.n    =*/ (int32_t) op->ne[1],
+        /*.bx   =*/ x->ne[2] == 1 && op->ne[2] > 1,
+        /*.bw   =*/ !w || w->ne[1] == 1,
+        /*.nbf1 =*/ fg->nb[1],
+        /*.nbf2 =*/ fg->nb[2],
+        /*.nbx1 =*/ x->nb[1],
+        /*.nbx2 =*/ x->nb[2],
+        /*.nbm1 =*/ m->nb[1],
+        /*.nbm2 =*/ m->nb[2],
+        /*.nb1  =*/ op->nb[1],
+        /*.nb2  =*/ op->nb[2],
+        /*.eps  =*/ eps,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_loop_gate(ctx->lib, w != nullptr);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(fg), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(m),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w ? w : fg), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 5);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+    if (w) {
+        // one threadgroup per row
+        ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], op->ne[2], 1, 256, 1, 1);
+    } else {
+        // elementwise: 64 float4 per threadgroup, over every core
+        ggml_metal_encoder_dispatch_threadgroups(enc, (op->ne[0]/4 + 63)/64, op->ne[1], op->ne[2], 64, 1, 1);
+    }
 
     return 1;
 }

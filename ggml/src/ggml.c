@@ -1152,9 +1152,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "SIGMOID_BACK",
     "DEPTH_MIX",
+    "LOOP_GATE",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1271,9 +1272,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "sigmoid_back(x)",
     "depth_mix(x)",
+    "loop_gate(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2940,6 +2942,38 @@ struct ggml_tensor * ggml_depth_mix(
     result->src[0] = cur;
     result->src[1] = query;
     result->src[2] = states;
+
+    return result;
+}
+
+// ggml_loop_gate
+
+struct ggml_tensor * ggml_loop_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * fg,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * m,
+        struct ggml_tensor  * w,
+        float                 eps) {
+    const int64_t E = m->ne[0];
+    const int64_t n = m->ne[1];
+    const int64_t B = m->ne[2];
+
+    GGML_ASSERT(fg->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && (!w || w->type == GGML_TYPE_F32));
+    GGML_ASSERT(fg->ne[0] == 2*E && fg->ne[1] == n && fg->ne[2] == B && fg->ne[3] == 1 && fg->nb[0] == sizeof(float));
+    GGML_ASSERT(x->ne[0] == E && x->ne[1] == n && (x->ne[2] == 1 || x->ne[2] == B) && x->ne[3] == 1 && x->nb[0] == sizeof(float));
+    GGML_ASSERT(m->ne[3] == 1 && m->nb[0] == sizeof(float));
+    GGML_ASSERT(!w || (w->ne[0] == E && (w->ne[1] == 1 || w->ne[1] == B) && ggml_is_contiguous(w)));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, n, B);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_LOOP_GATE;
+    result->src[0] = fg;
+    result->src[1] = x;
+    result->src[2] = m;
+    result->src[3] = w;
 
     return result;
 }

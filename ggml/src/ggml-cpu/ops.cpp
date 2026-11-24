@@ -2973,6 +2973,45 @@ void ggml_compute_forward_depth_mix(
     }
 }
 
+// ggml_compute_forward_loop_gate
+
+void ggml_compute_forward_loop_gate(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * fg = dst->src[0];
+    const ggml_tensor * x  = dst->src[1];
+    const ggml_tensor * m  = dst->src[2];
+    const ggml_tensor * w  = dst->src[3];
+
+    const int64_t E = dst->ne[0];
+    const int64_t n = dst->ne[1];
+    const int64_t B = dst->ne[2];
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    std::vector<float> y(E);
+    for (int64_t r = params->ith; r < n*B; r += params->nth) {
+        const int64_t t = r % n;
+        const int64_t b = r / n;
+        const float * f  = (const float *) ((const char *) fg->data + t*fg->nb[1] + b*fg->nb[2]);
+        const float * g  = f + E;
+        const float * xr = (const float *) ((const char *) x->data + t*x->nb[1] + (x->ne[2] == 1 ? 0 : b)*x->nb[2]);
+        const float * mr = (const float *) ((const char *) m->data + t*m->nb[1] + b*m->nb[2]);
+        const float * wr = w ? (const float *) w->data + (w->ne[1] == 1 ? 0 : b)*E : nullptr;
+        float ss = 0.0f;
+        for (int64_t e = 0; e < E; ++e) {
+            y[e] = (xr[e] - tanhf(f[e])*xr[e]) + tanhf(g[e])*mr[e];
+            ss += y[e]*y[e];
+        }
+        const float scale = 1.0f/sqrtf(ss/E + eps);
+        float * out = (float *) ((char *) dst->data + t*dst->nb[1] + b*dst->nb[2]);
+        for (int64_t e = 0; e < E; ++e) {
+            out[e] = wr ? (y[e]*scale)*wr[e] : y[e];
+        }
+    }
+}
+
 // ggml_compute_forward_sigmoid_back
 
 static void ggml_compute_forward_sigmoid_back_f32(

@@ -708,6 +708,22 @@ typedef struct {
 } ggml_metal_kargs_conv_state;
 
 typedef struct {
+    int32_t  E;
+    int32_t  n;
+    int32_t  bx;    // 1: x broadcasts over the batch
+    int32_t  bw;    // 1: w broadcasts over the batch
+    uint64_t nbf1;  // fg, per token
+    uint64_t nbf2;  // fg, per batch
+    uint64_t nbx1;
+    uint64_t nbx2;
+    uint64_t nbm1;
+    uint64_t nbm2;
+    uint64_t nb1;   // dst, per token
+    uint64_t nb2;   // dst, per batch
+    float    eps;
+} ggml_metal_kargs_loop_gate;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

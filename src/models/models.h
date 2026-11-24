@@ -2595,6 +2595,8 @@ struct llama_model_inkling2 : public llama_model_base {
     std::unordered_map<const ggml_tensor *, ggml_tensor *> conv_folded;
     // derived at load: the relative-bias tables times the R clip threshold, with the zero row of the out-of-extent positions, by source weight
     std::unordered_map<const ggml_tensor *, ggml_tensor *> rel_bias_padded;
+    // derived at load: the q, k and v input norms of a full-attention layer stacked [n_embd, 3], by its q input norm
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> qkv_norm_stacked;
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
@@ -2609,8 +2611,9 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
                 int64_t offset);
+        // norm_w: also RMS-normalize the result and scale it by norm_w (one fused op), when the model has the derived weights
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * cur_norm, ggml_tensor * message, ggml_tensor * message_norm,
-                const loop_layer & loop, int ctrl);
+                const loop_layer & loop, int ctrl, ggml_tensor * norm_w = nullptr, bool * normed = nullptr);
 
     protected:
         // the helpers alone, a derived graph builds its own body
