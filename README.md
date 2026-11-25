@@ -1,5 +1,7 @@
 # llama.cpp-inkling
 
+> **Moved:** this patch set now lives as a proper fork with an update and install pipeline: https://github.com/GlebRadchenko/llama.cpp (branch `inkling`). This repo is archived.
+
 Faster **Inkling-2-Mini** on Apple Silicon: Unsloth's llama.cpp plus 11 patches (Metal kernels and fused ggml ops).
 Same GGUF, same quality (compared against a CPU reference, as close as stock Metal is), **~1.7× decode on an M1 Max**.
 
